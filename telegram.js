@@ -158,6 +158,16 @@ export function isEnabled() {
   return !!TOKEN;
 }
 
+export function getTelegramConnectivityStatus() {
+  return {
+    tokenConfigured: !!TOKEN,
+    chatIdConfigured: !!chatId,
+    allowedUserIdsConfigured: ALLOWED_USER_IDS.size > 0,
+    allowedUserIdCount: ALLOWED_USER_IDS.size,
+    polling: _polling,
+  };
+}
+
 async function postTelegram(method, body) {
   if (!TOKEN || !chatId) return null;
   try {
@@ -507,14 +517,30 @@ async function poll(onMessage) {
 }
 
 export function startPolling(onMessage) {
-  if (!TOKEN) return;
+  if (!TOKEN) {
+    log("telegram", "Polling disabled: TELEGRAM_BOT_TOKEN is not configured.");
+    return false;
+  }
+  if (!chatId) {
+    log("telegram", "Polling disabled: TELEGRAM_CHAT_ID / user-config.telegramChatId is not configured.");
+    return false;
+  }
+  if (_polling) {
+    log("telegram", "Bot polling already running.");
+    return true;
+  }
   _polling = true;
   poll(onMessage); // fire-and-forget
-  log("telegram", "Bot polling started");
+  log(
+    "telegram",
+    `Bot polling started. Chat configured: yes. Allowed user IDs: ${ALLOWED_USER_IDS.size > 0 ? ALLOWED_USER_IDS.size : "private chat only"}. Digest mode: ${telegramConfig().digestMode ? "on" : "off"}.`,
+  );
+  return true;
 }
 
 export function stopPolling() {
   _polling = false;
+  log("telegram", "Bot polling stopped");
 }
 
 // ─── Notification helpers ────────────────────────────────────────

@@ -34,7 +34,7 @@ import {
   createLiveMessage,
 } from "./telegram.js";
 import { generateBriefing } from "./briefing.js";
-import { getLastBriefingDate, setLastBriefingDate, getTrackedPosition, getTrackedPositions, setPositionInstruction, updatePnlAndCheckExits, queuePeakConfirmation, resolvePendingPeak, queueTrailingDropConfirmation, resolvePendingTrailingDrop, trackPaperPosition, getPaperPositions, closePaperPosition, getPaperPnlSummary, updatePaperPositionPnl, initPaperAccount, getPaperAccount, computePaperDeployAmount, canOpenPaperPosition, getPaperHealthContext } from "./state.js";
+import { getLastBriefingDate, setLastBriefingDate, getTrackedPosition, getTrackedPositions, setPositionInstruction, updatePnlAndCheckExits, queuePeakConfirmation, resolvePendingPeak, queueTrailingDropConfirmation, resolvePendingTrailingDrop, trackPaperPosition, getPaperPositions, closePaperPosition, getPaperPnlSummary, updatePaperPositionPnl, initPaperAccount, getPaperAccount, computePaperDeployAmount, canOpenPaperPosition, getPaperHealthContext, getPaperLifecycleReport } from "./state.js";
 import { getActiveStrategy } from "./strategy-library.js";
 import { recordPositionSnapshot, recallForPool, addPoolNote } from "./pool-memory.js";
 import { checkSmartWalletsOnPool } from "./smart-wallets.js";
@@ -1040,6 +1040,8 @@ export function startCronJobs() {
 
   const screenTask = cron.schedule(`*/${Math.max(1, config.schedule.screeningIntervalMin)} * * * *`, runScreeningCycle);
 
+  startPolling(telegramHandler);
+
   const healthTask = cron.schedule(`0 * * * *`, async () => {
     if (_managementBusy) return;
     _managementBusy = true;
@@ -1324,6 +1326,67 @@ function formatWalletStatus(wallet, positions) {
   return lines.join("\n");
 }
 
+function formatPaperStatus() {
+  const health = getPaperHealthContext(paperOptions());
+  const paper = getPaperPnlSummary();
+  const lines = [
+    "Paper mode status",
+    "",
+    `Virtual balance: ${health.available_balance_sol} SOL`,
+    `Deployed: ${health.deployed_balance_sol} SOL`,
+    `Open positions: ${health.open_positions}/${config.paper.maxOpenPositions}`,
+    `Next paper deploy: ${health.deploy_amount_sol} SOL`,
+    `Closed positions: ${paper.closed_count}`,
+    `Win rate: ${paper.win_rate}%`,
+    `Realized PnL: ${paper.total_pnl_sol >= 0 ? "+" : ""}${paper.total_pnl_sol.toFixed(6)} SOL`,
+    `DRY_RUN: ${process.env.DRY_RUN === "true" ? "yes" : "no"}`,
+  ];
+  const open = getPaperPositions(true);
+  if (open.length > 0) {
+    lines.push("");
+    lines.push("Open paper positions:");
+    for (const p of open.slice(0, 8)) {
+      const pnl = Number.isFinite(p.last_paper_pnl_pct) ? `${p.last_paper_pnl_pct.toFixed(2)}%` : "n/a";
+      lines.push(`- ${p.pool_name || p.pool}: ${p.amount_sol ?? "?"} SOL | PnL ${pnl}`);
+    }
+  }
+  return lines.join("\n");
+}
+
+function formatPaperReportSummary() {
+  const report = getPaperLifecycleReport(10);
+  const lines = [
+    "Paper trading report",
+    "",
+    `Closed: ${report.total_closed}`,
+    `Win rate: ${report.win_rate_pct ?? "n/a"}%`,
+    `Avg realized PnL: ${report.avg_realized_pnl_pct ?? "n/a"}%`,
+    `Avg hold: ${report.avg_hold_duration_minutes ?? "n/a"}m`,
+    `Avg max unrealized: ${report.avg_max_unrealized_pnl_pct ?? "n/a"}%`,
+    `Avg giveback: ${report.avg_giveback_from_peak_pct ?? "n/a"}%`,
+    `Avg range efficiency: ${report.avg_range_efficiency_pct ?? "n/a"}%`,
+    `Avg volume decay: ${report.avg_volume_decay_pct ?? "n/a"}%`,
+  ];
+  if (report.best_trade) lines.push(`Best: ${report.best_trade.pool_name || report.best_trade.position} ${report.best_trade.realized_pnl_pct}%`);
+  if (report.worst_trade) lines.push(`Worst: ${report.worst_trade.pool_name || report.worst_trade.position} ${report.worst_trade.realized_pnl_pct}%`);
+  if (report.close_reasons?.length) {
+    lines.push("");
+    lines.push("Close reasons:");
+    for (const item of report.close_reasons.slice(0, 5)) {
+      lines.push(`- ${item.reason}: ${item.count}`);
+    }
+  }
+  if (report.recent?.length) {
+    lines.push("");
+    lines.push("Last closed:");
+    for (const trade of report.recent.slice(0, 10)) {
+      const pnl = Number.isFinite(trade.realized_pnl_pct) ? `${trade.realized_pnl_pct.toFixed(2)}%` : "n/a";
+      lines.push(`- ${trade.pool_name || trade.position}: ${pnl} | ${trade.close_reason || "unknown"}`);
+    }
+  }
+  return lines.join("\n");
+}
+
 function formatConfigSnapshot() {
   return [
     "Config snapshot",
@@ -1598,6 +1661,10 @@ function formatHelpText() {
   return [
     "Telegram commands",
     "",
+    "Paper mode commands",
+    "/paper - paper account and open simulated positions",
+    "/paper_report - paper lifecycle performance report",
+    "",
     "/help — show commands",
     "/status — wallet + positions snapshot",
     "/wallet — wallet, deploy amount, HiveMind status",
@@ -1757,8 +1824,21 @@ async function telegramHandler(msg) {
     return;
   }
 
+  if (text === "/paper" || text === "/paper_report") {
+    try {
+      await sendMessage(text === "/paper" ? formatPaperStatus() : formatPaperReportSummary()).catch(() => {});
+    } catch (e) {
+      await sendMessage(`Error: ${e.message}`).catch(() => {});
+    }
+    return;
+  }
+
   if (text === "/wallet" || text === "/status") {
     try {
+      if (isPaperOnlyMode()) {
+        await sendMessage(formatPaperStatus()).catch(() => {});
+        return;
+      }
       const [wallet, positions] = await Promise.all([getWalletBalances(), getMyPositions({ force: true })]);
       const suffix = text === "/status" && positions.total_positions
         ? `\n\nUse /positions for the numbered list.`
@@ -1777,6 +1857,16 @@ async function telegramHandler(msg) {
 
   if (text === "/positions") {
     try {
+      if (isPaperOnlyMode()) {
+        const positions = getPaperPositions(true);
+        if (positions.length === 0) { await sendMessage("No open paper positions."); return; }
+        const lines = positions.map((p, i) => {
+          const pnl = Number.isFinite(p.last_paper_pnl_pct) ? `${p.last_paper_pnl_pct.toFixed(2)}%` : "n/a";
+          return `${i + 1}. ${p.pool_name || p.pool} | ${p.amount_sol ?? "?"} SOL | PnL: ${pnl} | ${p.last_paper_in_range === false ? "OOR" : "in range"}`;
+        });
+        await sendMessage(`Open paper positions (${positions.length}):\n\n${lines.join("\n")}`).catch(() => {});
+        return;
+      }
       const { positions, total_positions } = await getMyPositions({ force: true });
       if (total_positions === 0) { await sendMessage("No open positions."); return; }
       const cur = config.management.solMode ? "◎" : "$";
@@ -1794,6 +1884,23 @@ async function telegramHandler(msg) {
   const poolMatch = text.match(/^\/pool\s+(\d+)$/i);
   if (poolMatch) {
     try {
+      if (isPaperOnlyMode()) {
+        const idx = parseInt(poolMatch[1]) - 1;
+        const positions = getPaperPositions(true);
+        if (idx < 0 || idx >= positions.length) { await sendMessage("Invalid number. Use /positions first."); return; }
+        const pos = positions[idx];
+        await sendMessage([
+          `${idx + 1}. ${pos.pool_name || pos.pool}`,
+          `Pool: ${pos.pool}`,
+          `Position: ${pos.position}`,
+          `Amount: ${pos.amount_sol ?? "?"} SOL`,
+          `PnL: ${Number.isFinite(pos.last_paper_pnl_pct) ? `${pos.last_paper_pnl_pct.toFixed(2)}%` : "n/a"}`,
+          `Max: ${Number.isFinite(pos.paper_max_unrealized_pnl_pct) ? `${pos.paper_max_unrealized_pnl_pct.toFixed(2)}%` : "n/a"}`,
+          `Min: ${Number.isFinite(pos.paper_min_unrealized_pnl_pct) ? `${pos.paper_min_unrealized_pnl_pct.toFixed(2)}%` : "n/a"}`,
+          `Range: ${pos.last_paper_in_range === false ? "OOR" : "in range"}`,
+        ].join("\n"));
+        return;
+      }
       const idx = parseInt(poolMatch[1]) - 1;
       const { positions } = await getMyPositions({ force: true });
       if (idx < 0 || idx >= positions.length) { await sendMessage("Invalid number. Use /positions first."); return; }
@@ -1817,6 +1924,10 @@ async function telegramHandler(msg) {
   const closeMatch = text.match(/^\/close\s+(\d+)$/i);
   if (closeMatch) {
     try {
+      if (isPaperOnlyMode()) {
+        await sendMessage("PAPER_ONLY mode blocks live close commands from Telegram. Paper positions are managed by the simulator.").catch(() => {});
+        return;
+      }
       const idx = parseInt(closeMatch[1]) - 1;
       const { positions } = await getMyPositions({ force: true });
       if (idx < 0 || idx >= positions.length) { await sendMessage("Invalid number. Use /positions first."); return; }
@@ -1836,6 +1947,10 @@ async function telegramHandler(msg) {
 
   if (text === "/closeall") {
     try {
+      if (isPaperOnlyMode()) {
+        await sendMessage("PAPER_ONLY mode blocks live close-all from Telegram. Paper positions are managed by the simulator.").catch(() => {});
+        return;
+      }
       const { positions } = await getMyPositions({ force: true });
       if (!positions.length) { await sendMessage("No open positions."); return; }
       await sendMessage(`Closing ${positions.length} position(s)...`);
@@ -1858,6 +1973,10 @@ async function telegramHandler(msg) {
   const setMatch = text.match(/^\/set\s+(\d+)\s+(.+)$/i);
   if (setMatch) {
     try {
+      if (isPaperOnlyMode()) {
+        await sendMessage("PAPER_ONLY mode blocks live position notes from Telegram.").catch(() => {});
+        return;
+      }
       const idx = parseInt(setMatch[1]) - 1;
       const note = setMatch[2].trim();
       const { positions } = await getMyPositions({ force: true });
@@ -1906,6 +2025,10 @@ async function telegramHandler(msg) {
   const deployMatch = text.match(/^\/deploy\s+(\d+)$/i);
   if (deployMatch) {
     try {
+      if (isPaperOnlyMode()) {
+        await sendMessage("PAPER_ONLY mode blocks manual Telegram deploy commands from reaching live trading. The paper simulator handles entries autonomously.").catch(() => {});
+        return;
+      }
       const idx = parseInt(deployMatch[1]) - 1;
       const { candidate, result, deployAmount, binsBelow } = await deployLatestCandidate(idx);
       const coverage = result.range_coverage
@@ -1982,6 +2105,10 @@ async function telegramHandler(msg) {
     log("telegram", `Incoming: ${text}`);
     const hasCloseIntent = /\bclose\b|\bsell\b|\bexit\b|\bwithdraw\b/i.test(text);
     const isDeployRequest = !hasCloseIntent && /\bdeploy\b|\bopen position\b|\blp into\b|\badd liquidity\b/i.test(text);
+    if (isPaperOnlyMode() && (hasCloseIntent || isDeployRequest)) {
+      await sendMessage("PAPER_ONLY mode blocks live trading actions from Telegram. Use /paper or /paper_report for simulator status.").catch(() => {});
+      return;
+    }
     const agentRole = isDeployRequest ? "SCREENER" : "GENERAL";
     const agentModel = agentRole === "SCREENER" ? config.llm.screeningModel : config.llm.generalModel;
     liveMessage = await createLiveMessage("🤖 Live Update", `Request: ${text.slice(0, 240)}`);

@@ -125,3 +125,11 @@ test("user-driven Telegram command replies are not suppressed", async () => {
   assert.equal(messages[0].body.text, "No open positions.");
   assert.equal(messages[1].body.text, "No open positions.");
 });
+
+test("telegram connectivity status reports configured command channel", () => {
+  const status = telegram.getTelegramConnectivityStatus();
+
+  assert.equal(status.tokenConfigured, true);
+  assert.equal(status.chatIdConfigured, true);
+  assert.equal(status.polling, false);
+});

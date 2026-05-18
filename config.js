@@ -44,6 +44,12 @@ if (process.env.PAPER_ONLY === "true" || u.paperOnly === true) {
 }
 if (u.publicApiKey) process.env.PUBLIC_API_KEY ||= u.publicApiKey;
 if (u.agentMeridianApiUrl) process.env.AGENT_MERIDIAN_API_URL ||= u.agentMeridianApiUrl;
+if (u.telegram?.botToken || u.telegramBotToken) process.env.TELEGRAM_BOT_TOKEN ||= u.telegram?.botToken || u.telegramBotToken;
+if (u.telegram?.chatId || u.telegramChatId) process.env.TELEGRAM_CHAT_ID ||= String(u.telegram?.chatId || u.telegramChatId);
+if (u.telegram?.allowedUserIds || u.telegramAllowedUserIds) {
+  const ids = u.telegram?.allowedUserIds || u.telegramAllowedUserIds;
+  process.env.TELEGRAM_ALLOWED_USER_IDS ||= Array.isArray(ids) ? ids.join(",") : String(ids);
+}
 
 const indicatorUserConfig = u.chartIndicators ?? {};
 
