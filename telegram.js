@@ -40,7 +40,43 @@ function telegramConfig() {
     verboseCycles: config.telegram?.verboseCycles === true,
     minNotifyIntervalSec: Number(config.telegram?.minNotifyIntervalSec ?? 300),
     verbosity: config.telegram?.verbosity || "normal",
+    conciseReplies: config.telegram?.conciseReplies !== false,
+    maxReplyLines: Math.max(5, Math.min(10, Number(config.telegram?.maxReplyLines ?? 8))),
   };
+}
+
+function normalizeOperatorText(text) {
+  return String(text ?? "")
+    .replace(/```[\s\S]*?```/g, (block) => block.replace(/```/g, "").trim())
+    .replace(/\*\*/g, "")
+    .replace(/^#{1,6}\s*/gm, "")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+}
+
+export function compactTelegramReply(text, options = {}) {
+  const cfg = telegramConfig();
+  if (options.concise === false || cfg.conciseReplies === false) {
+    return String(text ?? "").slice(0, 4096);
+  }
+  const maxLines = Math.max(5, Math.min(10, Number(options.maxLines ?? cfg.maxReplyLines)));
+  const normalized = normalizeOperatorText(text);
+  const rawLines = normalized.split(/\r?\n/);
+  const lines = [];
+  for (const raw of rawLines) {
+    const line = raw.trim();
+    if (!line) {
+      if (lines.length > 0 && lines[lines.length - 1] !== "") lines.push("");
+      continue;
+    }
+    lines.push(line.replace(/^[-*]\s+/, "- "));
+  }
+  const compact = lines.filter((line, index) => line || (lines[index - 1] && lines[index + 1]));
+  if (compact.length <= maxLines) return compact.join("\n").slice(0, 4096);
+  return [
+    ...compact.slice(0, maxLines - 1),
+    "More: ask for details.",
+  ].join("\n").slice(0, 4096);
 }
 
 function shouldCooldown(key, priority) {
@@ -211,7 +247,8 @@ async function postTelegramRaw(method, body) {
 export async function sendMessage(text, options = {}) {
   if (!TOKEN || !chatId) return;
   if (options.key && shouldCooldown(options.key, options.priority || "medium")) return null;
-  return postTelegram("sendMessage", { text: String(text).slice(0, 4096) });
+  const bodyText = compactTelegramReply(text, options);
+  return postTelegram("sendMessage", { text: bodyText });
 }
 
 export async function sendMessageWithButtons(text, inlineKeyboard) {
@@ -225,7 +262,8 @@ export async function sendMessageWithButtons(text, inlineKeyboard) {
 export async function sendHTML(html, options = {}) {
   if (!TOKEN || !chatId) return;
   if (options.key && shouldCooldown(options.key, options.priority || "medium")) return null;
-  return postTelegram("sendMessage", { text: html.slice(0, 4096), parse_mode: "HTML" });
+  const bodyText = options.concise === true ? compactTelegramReply(html, options) : html.slice(0, 4096);
+  return postTelegram("sendMessage", { text: bodyText, parse_mode: "HTML" });
 }
 
 export async function editMessage(text, messageId) {
@@ -453,7 +491,7 @@ export async function createLiveMessage(title, intro = "Starting...", options = 
         state.flushTimer = null;
       }
       if (state.flushPromise) await state.flushPromise;
-      state.footer = finalText;
+      state.footer = compactTelegramReply(finalText, { concise: options.concise !== false });
       await flushNow();
       _liveMessageDepth = Math.max(0, _liveMessageDepth - 1);
       typing.stop();

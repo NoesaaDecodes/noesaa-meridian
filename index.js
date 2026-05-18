@@ -1329,61 +1329,43 @@ function formatWalletStatus(wallet, positions) {
 function formatPaperStatus() {
   const health = getPaperHealthContext(paperOptions());
   const paper = getPaperPnlSummary();
-  const lines = [
-    "Paper mode status",
-    "",
-    `Virtual balance: ${health.available_balance_sol} SOL`,
-    `Deployed: ${health.deployed_balance_sol} SOL`,
-    `Open positions: ${health.open_positions}/${config.paper.maxOpenPositions}`,
-    `Next paper deploy: ${health.deploy_amount_sol} SOL`,
-    `Closed positions: ${paper.closed_count}`,
-    `Win rate: ${paper.win_rate}%`,
-    `Realized PnL: ${paper.total_pnl_sol >= 0 ? "+" : ""}${paper.total_pnl_sol.toFixed(6)} SOL`,
-    `DRY_RUN: ${process.env.DRY_RUN === "true" ? "yes" : "no"}`,
-  ];
   const open = getPaperPositions(true);
+  const mainBlocker = health.deploy_amount_sol > 0
+    ? "none"
+    : `virtual balance below ${config.paper.minDeploySol} SOL`;
+  const lines = [
+    "PAPER STATUS",
+    `Balance: ${health.available_balance_sol} SOL | Deployed: ${health.deployed_balance_sol} SOL`,
+    `Positions: ${health.open_positions}/${config.paper.maxOpenPositions} open | ${paper.closed_count} closed`,
+    `Next deploy: ${health.deploy_amount_sol} SOL`,
+    `Realized: ${paper.total_pnl_sol >= 0 ? "+" : ""}${paper.total_pnl_sol.toFixed(6)} SOL | Win: ${paper.win_rate}%`,
+    `Main blocker: ${mainBlocker}`,
+    `Mode: PAPER_ONLY | DRY_RUN ${process.env.DRY_RUN === "true" ? "on" : "off"}`,
+  ];
   if (open.length > 0) {
-    lines.push("");
-    lines.push("Open paper positions:");
-    for (const p of open.slice(0, 8)) {
-      const pnl = Number.isFinite(p.last_paper_pnl_pct) ? `${p.last_paper_pnl_pct.toFixed(2)}%` : "n/a";
-      lines.push(`- ${p.pool_name || p.pool}: ${p.amount_sol ?? "?"} SOL | PnL ${pnl}`);
-    }
+    const p = open[0];
+    const pnl = Number.isFinite(p.last_paper_pnl_pct) ? `${p.last_paper_pnl_pct.toFixed(2)}%` : "n/a";
+    lines.push(`Top open: ${p.pool_name || p.pool} | ${p.amount_sol ?? "?"} SOL | PnL ${pnl}`);
+  } else {
+    lines.push("Recommendation: wait for qualifying screen.");
   }
   return lines.join("\n");
 }
 
 function formatPaperReportSummary() {
   const report = getPaperLifecycleReport(10);
+  const topReason = report.close_reasons?.[0];
   const lines = [
-    "Paper trading report",
-    "",
-    `Closed: ${report.total_closed}`,
-    `Win rate: ${report.win_rate_pct ?? "n/a"}%`,
-    `Avg realized PnL: ${report.avg_realized_pnl_pct ?? "n/a"}%`,
-    `Avg hold: ${report.avg_hold_duration_minutes ?? "n/a"}m`,
-    `Avg max unrealized: ${report.avg_max_unrealized_pnl_pct ?? "n/a"}%`,
-    `Avg giveback: ${report.avg_giveback_from_peak_pct ?? "n/a"}%`,
-    `Avg range efficiency: ${report.avg_range_efficiency_pct ?? "n/a"}%`,
-    `Avg volume decay: ${report.avg_volume_decay_pct ?? "n/a"}%`,
+    "PAPER REPORT",
+    `Trades: ${report.total_closed} | Win: ${report.win_rate_pct ?? "n/a"}%`,
+    `Avg realized: ${report.avg_realized_pnl_pct ?? "n/a"}% | Hold: ${report.avg_hold_duration_minutes ?? "n/a"}m`,
+    `Peak: ${report.avg_max_unrealized_pnl_pct ?? "n/a"}% | Giveback: ${report.avg_giveback_from_peak_pct ?? "n/a"}%`,
+    `Range eff: ${report.avg_range_efficiency_pct ?? "n/a"}% | Vol decay: ${report.avg_volume_decay_pct ?? "n/a"}%`,
+    `Close reason: ${topReason ? `${topReason.reason} (${topReason.count})` : "n/a"}`,
   ];
   if (report.best_trade) lines.push(`Best: ${report.best_trade.pool_name || report.best_trade.position} ${report.best_trade.realized_pnl_pct}%`);
   if (report.worst_trade) lines.push(`Worst: ${report.worst_trade.pool_name || report.worst_trade.position} ${report.worst_trade.realized_pnl_pct}%`);
-  if (report.close_reasons?.length) {
-    lines.push("");
-    lines.push("Close reasons:");
-    for (const item of report.close_reasons.slice(0, 5)) {
-      lines.push(`- ${item.reason}: ${item.count}`);
-    }
-  }
-  if (report.recent?.length) {
-    lines.push("");
-    lines.push("Last closed:");
-    for (const trade of report.recent.slice(0, 10)) {
-      const pnl = Number.isFinite(trade.realized_pnl_pct) ? `${trade.realized_pnl_pct.toFixed(2)}%` : "n/a";
-      lines.push(`- ${trade.pool_name || trade.position}: ${pnl} | ${trade.close_reason || "unknown"}`);
-    }
-  }
+  lines.push(report.total_closed > 0 ? "Recommendation: review worst reason before tuning." : "Recommendation: collect closed trades first.");
   return lines.join("\n");
 }
 
@@ -1659,32 +1641,14 @@ async function applySettingsMenuCallback(msg) {
 
 function formatHelpText() {
   return [
-    "Telegram commands",
-    "",
-    "Paper mode commands",
-    "/paper - paper account and open simulated positions",
-    "/paper_report - paper lifecycle performance report",
-    "",
-    "/help — show commands",
-    "/status — wallet + positions snapshot",
-    "/wallet — wallet, deploy amount, HiveMind status",
-    "/positions — list open positions",
-    "/pool <n> — detailed info for one open position",
-    "/close <n> — close one position by index",
-    "/closeall — close all open positions",
-    "/set <n> <note> — set note/instruction on position",
-    "/config — show important runtime config",
-    "/settings — button menu for common config",
-    "/setcfg <key> <value> — update persisted config",
-    "/screen — refresh deterministic candidate list",
-    "/candidates — show latest cached candidates",
-    "/deploy <n> — deploy candidate by cached index",
-    "/briefing — morning briefing",
-    "/hive — HiveMind sync status",
-    "/hive pull — manual HiveMind pull now",
-    "/pause — stop cron cycles",
-    "/resume — start cron cycles again",
-    "/stop — shut down agent",
+    "COMMANDS",
+    "/status - account + positions",
+    "/paper - paper status",
+    "/paper_report - lifecycle report",
+    "/positions | /pool <n>",
+    "/screen | /candidates",
+    "/settings | /config",
+    "/pause | /resume | /stop",
   ].join("\n");
 }
 

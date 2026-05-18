@@ -162,6 +162,8 @@ export const config = {
     verboseCycles: u.telegram?.verboseCycles ?? u.telegramVerboseCycles ?? false,
     minNotifyIntervalSec: u.telegram?.minNotifyIntervalSec ?? u.telegramMinNotifyIntervalSec ?? 300,
     verbosity: u.telegram?.verbosity ?? u.telegramVerbosity ?? "normal",
+    conciseReplies: u.telegram?.conciseReplies ?? u.telegramConciseReplies ?? true,
+    maxReplyLines: Number(u.telegram?.maxReplyLines ?? u.telegramMaxReplyLines ?? 8),
   },
 
   // ─── LLM Settings ──────────────────────

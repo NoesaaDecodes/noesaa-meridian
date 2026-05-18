@@ -133,3 +133,26 @@ test("telegram connectivity status reports configured command channel", () => {
   assert.equal(status.chatIdConfigured, true);
   assert.equal(status.polling, false);
 });
+
+test("concise Telegram replies are capped for operator readability", async () => {
+  config.telegram.conciseReplies = true;
+  config.telegram.maxReplyLines = 6;
+
+  await telegram.sendMessage([
+    "# Full Analysis",
+    "",
+    "Action: hold",
+    "Reason: no qualifying setup",
+    "Metric: fee/TVL 0.01%",
+    "Metric: API 401 auth issue",
+    "What this means: long explanatory paragraph that should not dominate.",
+    "Recommendation: refresh API key",
+    "Extra: ask for details",
+  ].join("\n"));
+
+  const [message] = sentMessages();
+  const lines = message.body.text.split(/\r?\n/);
+  assert.ok(lines.length <= 6);
+  assert.equal(lines[0], "Full Analysis");
+  assert.match(message.body.text, /More: ask for details\./);
+});

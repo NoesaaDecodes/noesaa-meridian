@@ -192,6 +192,7 @@ function isToolChoiceRequiredError(error) {
  */
 export async function agentLoop(goal, maxSteps = config.llm.maxSteps, sessionHistory = [], agentType = "GENERAL", model = null, maxOutputTokens = null, options = {}) {
   const { interactive = false, onToolStart = null, onToolFinish = null } = options;
+  const telegramConcise = interactive && config.telegram?.conciseReplies !== false;
   // Build dynamic system prompt with current portfolio state
   const [portfolio, positions] = isPaperOnlyMode()
     ? [getPaperPortfolioForPrompt(), getPaperPositionsForPrompt()]
@@ -208,7 +209,7 @@ export async function agentLoop(goal, maxSteps = config.llm.maxSteps, sessionHis
       if (config.darwin?.enabled) weightsSummary = getWeightsSummary();
     } catch { /* signal-weights not critical */ }
   }
-  const systemPrompt = buildSystemPrompt(agentType, portfolio, positions, stateSummary, lessons, perfSummary, weightsSummary, decisionSummary);
+  const systemPrompt = buildSystemPrompt(agentType, portfolio, positions, stateSummary, lessons, perfSummary, weightsSummary, decisionSummary, { telegramConcise });
 
   let providerMode = "system";
   let messages = buildMessages(systemPrompt, sessionHistory, goal, providerMode);
@@ -246,7 +247,7 @@ export async function agentLoop(goal, maxSteps = config.llm.maxSteps, sessionHis
             tools: getToolsForRole(agentType, goal),
             tool_choice: toolChoice,
             temperature: config.llm.temperature,
-            max_tokens: maxOutputTokens ?? config.llm.maxTokens,
+            max_tokens: maxOutputTokens ?? (telegramConcise ? Math.min(config.llm.maxTokens, 700) : config.llm.maxTokens),
           });
         } catch (error) {
           if (providerMode === "system" && isSystemRoleError(error)) {
