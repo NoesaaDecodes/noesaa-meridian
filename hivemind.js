@@ -167,6 +167,7 @@ export function getSharedLessonsForPrompt({ agentType = "GENERAL", maxLessons = 
 
 export async function registerHiveMindAgent({ reason = "heartbeat" } = {}) {
   if (!isHiveMindEnabled()) return null;
+  if (!getApiKey() || getApiKey() === "bWVyaWRpYW4taXMtdGhlLWJlc3QtYWdlbnRz") return null;
   try {
     return await requestJson("/api/hivemind/agents/register", {
       method: "POST",
@@ -190,6 +191,7 @@ export async function registerHiveMindAgent({ reason = "heartbeat" } = {}) {
 
 export async function pullHiveMindLessons(limit = 12) {
   if (!isHiveMindEnabled()) return null;
+  if (!getApiKey() || getApiKey() === "bWVyaWRpYW4taXMtdGhlLWJlc3QtYWdlbnRz") return null;
   try {
     const payload = await requestJson("/api/hivemind/lessons/pull", {
       query: { agentId: getAgentId(), limit },
@@ -209,6 +211,7 @@ export async function pullHiveMindLessons(limit = 12) {
 
 export async function pullHiveMindPresets() {
   if (!isHiveMindEnabled()) return null;
+  if (!getApiKey() || getApiKey() === "bWVyaWRpYW4taXMtdGhlLWJlc3QtYWdlbnRz") return null;
   try {
     const payload = await requestJson("/api/hivemind/presets/pull", {
       query: { agentId: getAgentId() },

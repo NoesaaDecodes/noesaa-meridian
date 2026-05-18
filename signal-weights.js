@@ -222,7 +222,7 @@ function computeNumericLift(signal, wins, losses, minSamples) {
   const winMean  = mean(winVals.map(normalize));
   const lossMean = mean(lossVals.map(normalize));
 
-  return HIGHER_IS_BETTER.has(signal) ? winMean - lossMean : Math.abs(winMean - lossMean);
+  return HIGHER_IS_BETTER.has(signal) ? winMean - lossMean : lossMean - winMean;
 }
 
 function computeBooleanLift(signal, wins, losses, minSamples) {

@@ -25,7 +25,7 @@ import {
   createLiveMessage,
 } from "./telegram.js";
 import { generateBriefing } from "./briefing.js";
-import { getLastBriefingDate, setLastBriefingDate, getTrackedPosition, getTrackedPositions, setPositionInstruction, updatePnlAndCheckExits, queuePeakConfirmation, resolvePendingPeak, queueTrailingDropConfirmation, resolvePendingTrailingDrop } from "./state.js";
+import { getLastBriefingDate, setLastBriefingDate, getTrackedPosition, getTrackedPositions, setPositionInstruction, updatePnlAndCheckExits, queuePeakConfirmation, resolvePendingPeak, queueTrailingDropConfirmation, resolvePendingTrailingDrop, trackPaperPosition, getPaperPositions, closePaperPosition, getPaperPnlSummary } from "./state.js";
 import { getActiveStrategy } from "./strategy-library.js";
 import { recordPositionSnapshot, recallForPool, addPoolNote } from "./pool-memory.js";
 import { checkSmartWalletsOnPool } from "./smart-wallets.js";
@@ -213,6 +213,62 @@ export async function runManagementCycle({ silent = false } = {}) {
     const livePositions = await getMyPositions({ force: true }).catch(() => null);
     positions = livePositions?.positions || [];
 
+    // ── Paper Trading: merge simulated positions in dry-run mode ──
+    const isDryRun = process.env.DRY_RUN === "true";
+    const paperPositionsRaw = isDryRun ? getPaperPositions(true) : [];
+    if (paperPositionsRaw.length > 0) {
+      const paperFormatted = [];
+      for (const pp of paperPositionsRaw) {
+        const tracked = getTrackedPosition(pp.position);
+        let currentPrice = null;
+        let pnlPct = 0;
+        let inRange = true;
+        let activeBin = null;
+        try {
+          const { getActiveBin } = await import("./tools/dlmm.js");
+          const binData = await getActiveBin({ pool_address: pp.pool });
+          currentPrice = binData.price;
+          activeBin = binData.binId;
+          if (pp.entry_price_sol && pp.entry_price_sol > 0) {
+            pnlPct = Math.round(((currentPrice - pp.entry_price_sol) / pp.entry_price_sol) * 10000) / 100;
+          }
+          const lowerBin = pp.bin_range?.min ?? null;
+          const upperBin = pp.bin_range?.max ?? null;
+          if (lowerBin != null && upperBin != null) {
+            inRange = activeBin >= lowerBin && activeBin <= upperBin;
+          }
+        } catch (e) {
+          log("paper_warn", `Failed to fetch price for paper position ${pp.pool_name}: ${e.message}`);
+          inRange = true; // reset — don't trust stale OOR state when fetch fails
+        }
+        const ageMinutes = pp.deployed_at ? Math.floor((Date.now() - new Date(pp.deployed_at).getTime()) / 60000) : 0;
+        const oorSince = !inRange ? (tracked?.out_of_range_since || new Date().toISOString()) : null;
+        paperFormatted.push({
+          position: pp.position,
+          pool: pp.pool,
+          pair: pp.pool_name || pp.pool.slice(0, 8),
+          base_mint: null,
+          lower_bin: pp.bin_range?.min ?? null,
+          upper_bin: pp.bin_range?.max ?? null,
+          active_bin: activeBin,
+          in_range: inRange,
+          unclaimed_fees_usd: 0,
+          total_value_usd: pp.amount_sol ? Math.round(pp.amount_sol * 10000) / 10000 : 0,
+          pnl_usd: 0,
+          pnl_pct: pnlPct,
+          pnl_pct_suspicious: false,
+          fee_per_tvl_24h: pp.fee_tvl_ratio ?? null,
+          age_minutes: ageMinutes,
+          minutes_out_of_range: oorSince ? Math.floor((Date.now() - new Date(oorSince).getTime()) / 60000) : 0,
+          instruction: tracked?.instruction ?? null,
+          collected_fees_usd: 0,
+          paper: true,
+        });
+      }
+      positions = [...positions, ...paperFormatted];
+      log("cron", `Paper trading: ${paperFormatted.length} simulated position(s) merged`);
+    }
+
     if (positions.length === 0) {
       log("cron", "No open positions — triggering screening cycle");
       mgmtReport = "No open positions. Triggering screening cycle.";
@@ -304,8 +360,55 @@ export async function runManagementCycle({ silent = false } = {}) {
     mgmtReport = reportLines.join("\n\n") +
       `\n\nSummary: 💼 ${positions.length} positions | ${cur}${totalValue.toFixed(4)} | fees: ${cur}${totalUnclaimed.toFixed(4)} | ${actionSummary}`;
 
-    // ── Call LLM only if action needed ──────────────────────────────
+    // ── Paper trading summary in management report ───────────────
+    if (isDryRun) {
+      const paper = getPaperPnlSummary();
+      if (paper.open_count > 0 || paper.closed_count > 0) {
+        const sign = paper.total_pnl_sol >= 0 ? "+" : "";
+        mgmtReport += `\n📄 Paper: ${paper.open_count} open, ${paper.closed_count} closed | WR ${paper.win_rate}% | PnL ${sign}${paper.total_pnl_sol.toFixed(6)} SOL`;
+      }
+    }
+
+    // ── Paper Trading: close simulated positions directly ─────────
+    if (isDryRun) {
+      for (const p of positionData) {
+        if (!p.paper) continue;
+        const act = actionMap.get(p.position);
+        if (act.action !== "CLOSE") continue;
+        const pnlPct = p.pnl_pct ?? 0;
+        const pnlSol = p.amount_sol ? Math.round(pnlPct / 100 * p.amount_sol * 1e9) / 1e9 : 0;
+        const closed = closePaperPosition(p.position, act.reason || "rule", pnlPct, pnlSol);
+        if (closed) {
+          const { recordPerformance } = await import("./lessons.js");
+          await recordPerformance({
+            position: p.position,
+            pool: p.pool,
+            pool_name: p.pair,
+            base_mint: null,
+            strategy: closed.strategy,
+            bin_range: closed.bin_range,
+            bin_step: closed.bin_step || null,
+            volatility: closed.volatility ?? null,
+            fee_tvl_ratio: closed.fee_tvl_ratio || null,
+            organic_score: closed.organic_score || null,
+            amount_sol: closed.amount_sol,
+            fees_earned_usd: 0,
+            final_value_usd: p.total_value_usd ?? 0,
+            initial_value_usd: closed.amount_sol ?? 0,
+            minutes_in_range: (p.age_minutes ?? 0) - (p.minutes_out_of_range ?? 0),
+            minutes_held: p.age_minutes ?? 0,
+            close_reason: `paper: ${act.reason || "rule"}`,
+            signal_snapshot: closed.signal_snapshot || null,
+          }).catch((e) => log("paper_warn", `Failed to record paper performance: ${e.message}`));
+          log("paper", `Paper closed: ${p.pair} — ${act.reason} — PnL ${pnlPct.toFixed(2)}% (${pnlSol} SOL)`);
+          mgmtReport += `\n📄 Paper closed: ${p.pair} | ${act.reason} | PnL ${pnlPct.toFixed(2)}% (${pnlSol} SOL)`;
+        }
+      }
+    }
+
+    // ── Call LLM only if action needed (real positions only) ────────
     const actionPositions = positionData.filter(p => {
+      if (p.paper) return false;
       const a = actionMap.get(p.position);
       return a.action !== "STAY";
     });
@@ -686,10 +789,38 @@ IMPORTANT:
           if (name === "deploy_position") deployAttempted = true;
           await liveMessage?.toolStart(name);
         },
-        onToolFinish: async ({ name, result, success }) => {
+        onToolFinish: async ({ name, args, result, success }) => {
           if (name === "deploy_position") {
             deployAttempted = true;
             deploySucceeded = Boolean(success && result?.success !== false && !result?.error && !result?.blocked);
+            // Paper trading: save simulated position in dry-run mode
+            if (deploySucceeded && process.env.DRY_RUN === "true" && result?.dry_run) {
+              const wd = result.would_deploy || {};
+              const fakeId = `paper_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+              const poolAddress = wd.pool_address || args?.pool_address;
+              let entryPrice = null;
+              try {
+                const { getActiveBin } = await import("./tools/dlmm.js");
+                const bin = await getActiveBin({ pool_address: poolAddress });
+                entryPrice = bin.price;
+              } catch (e) { log("paper_warn", `Could not fetch entry price: ${e.message}`); }
+              const activeBinId = args?.active_bin ?? null;
+              trackPaperPosition({
+                position: fakeId,
+                pool: poolAddress,
+                pool_name: args?.pool_name || poolAddress?.slice(0, 8),
+                strategy: wd.strategy || args?.strategy,
+                bin_range: { min: activeBinId != null ? activeBinId - (wd.bins_below ?? 0) : null, max: activeBinId != null ? activeBinId + (wd.bins_above ?? 0) : null },
+                amount_sol: wd.amount_y ?? args?.amount_y ?? args?.amount_sol ?? 0,
+                active_bin: activeBinId,
+                bin_step: args?.bin_step ?? null,
+                volatility: args?.volatility ?? null,
+                fee_tvl_ratio: args?.fee_tvl_ratio ?? null,
+                organic_score: args?.organic_score ?? null,
+                entry_price_sol: entryPrice,
+              });
+              log("paper", `Paper position saved: ${fakeId} in ${args?.pool_name || poolAddress?.slice(0, 8)}`);
+            }
           }
           await liveMessage?.toolFinish(name, result, success);
         },
@@ -926,6 +1057,7 @@ function getDeterministicCloseRule(position, managementConfig) {
     return { action: "CLOSE", rule: 4, reason: "OOR" };
   }
   if (
+    !position.paper &&
     position.fee_per_tvl_24h != null &&
     position.fee_per_tvl_24h < managementConfig.minFeePerTvl24h &&
     (position.age_minutes ?? 0) >= 60
@@ -977,14 +1109,32 @@ function describeLatestCandidates(limit = 5) {
 function formatWalletStatus(wallet, positions) {
   const deployAmount = computeDeployAmount(wallet.sol);
   const hive = isHiveMindEnabled() ? "on" : "off";
-  return [
+  const lines = [
     `Wallet: ${wallet.sol} SOL ($${wallet.sol_usd})`,
     `SOL price: $${wallet.sol_price}`,
     `Open positions: ${positions.total_positions}/${config.risk.maxPositions}`,
     `Next deploy amount: ${deployAmount} SOL`,
     `Dry run: ${process.env.DRY_RUN === "true" ? "yes" : "no"}`,
     `HiveMind: ${hive}`,
-  ].join("\n");
+  ];
+  if (process.env.DRY_RUN === "true") {
+    const paper = getPaperPnlSummary();
+    if (paper.closed_count > 0 || paper.open_count > 0) {
+      lines.push("");
+      lines.push("--- Paper Trading ---");
+      lines.push(`Open: ${paper.open_count} | Closed: ${paper.closed_count}`);
+      lines.push(`Win rate: ${paper.win_rate}% | Avg win: ${paper.avg_win.toFixed(1)}% | Avg loss: ${paper.avg_loss.toFixed(1)}%`);
+      lines.push(`Total PnL: ${paper.total_pnl_sol >= 0 ? "+" : ""}${paper.total_pnl_sol.toFixed(6)} SOL`);
+      if (paper.recent.length > 0) {
+        lines.push("Recent closes:");
+        for (const r of paper.recent) {
+          const sign = (r.pnl_pct ?? 0) >= 0 ? "+" : "";
+          lines.push(`  ${r.pair ?? "?"} — ${r.reason} — ${sign}${(r.pnl_pct ?? 0).toFixed(1)}% (${sign}${(r.pnl_sol ?? 0).toFixed(6)} SOL)`);
+        }
+      }
+    }
+  }
+  return lines.join("\n");
 }
 
 function formatConfigSnapshot() {
@@ -1864,6 +2014,15 @@ Commands:
         for (const p of positions.positions) {
           const status = p.in_range ? "in-range ✓" : "OUT OF RANGE ⚠";
           console.log(`  ${p.pair.padEnd(16)} ${status}  fees: ${config.management.solMode ? "◎" : "$"}${p.unclaimed_fees_usd}`);
+        }
+        if (process.env.DRY_RUN === "true") {
+          const paper = getPaperPnlSummary();
+          if (paper.open_count > 0 || paper.closed_count > 0) {
+            const sign = paper.total_pnl_sol >= 0 ? "+" : "";
+            console.log(`\n--- Paper Trading ---`);
+            console.log(`Open: ${paper.open_count} | Closed: ${paper.closed_count}`);
+            console.log(`Win rate: ${paper.win_rate}% | PnL: ${sign}${paper.total_pnl_sol.toFixed(6)} SOL`);
+          }
         }
         console.log();
       });

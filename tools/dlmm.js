@@ -12,6 +12,23 @@ import {
 import BN from "bn.js";
 import bs58 from "bs58";
 import { config, computeDeployAmount, MIN_SAFE_BINS_BELOW } from "../config.js";
+
+// ─── MEV Protection Helpers ────────────────────────────────────
+function computeDynamicSlippage(volatility) {
+  if (volatility == null || !Number.isFinite(volatility) || volatility <= 0) return 1000;
+  if (volatility <= 0.5) return 500;
+  if (volatility <= 1.0) return 750;
+  if (volatility <= 2.0) return 1000;
+  return 1500;
+}
+
+function preDeployJitter() {
+  const min = config.mev?.preDeployDelayMinMs ?? 2000;
+  const max = config.mev?.preDeployDelayMaxMs ?? 8000;
+  const ms = Math.floor(Math.random() * (max - min + 1)) + min;
+  log("mev", `Pre-deploy jitter: ${ms}ms`);
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
 import { log } from "../logger.js";
 import {
   trackPosition,
@@ -494,6 +511,17 @@ export async function deployPosition({
   const actualBinStep = pool.lbPair.binStep;
   const activePrice = Number(getPriceOfBinByBinId(activeBin.binId, actualBinStep).toString());
 
+  // Fee/active-TVL validation — skip in dry-run so paper trading can track any pool
+  if (process.env.DRY_RUN !== "true") {
+    const minFeeActiveTvl = Number(config.screening?.minFeeActiveTvlRatio ?? 0);
+    if (minFeeActiveTvl > 0 && fee_tvl_ratio != null && fee_tvl_ratio < minFeeActiveTvl) {
+      return {
+        success: false,
+        error: `Pool fee/active-TVL ${fee_tvl_ratio}% is below configured minFeeActiveTvlRatio ${minFeeActiveTvl}%.`,
+      };
+    }
+  }
+
   if (downside_pct != null || upside_pct != null) {
     const downsidePct = Math.max(0, Number(downside_pct ?? 0));
     const upsidePct = Math.max(0, Number(upside_pct ?? 0));
@@ -757,6 +785,8 @@ export async function deployPosition({
     }
   }
 
+  await preDeployJitter();
+
   const wallet = getWallet();
   const newPosition = Keypair.generate();
 
@@ -797,7 +827,7 @@ export async function deployPosition({
         totalXAmount: totalXLamports,
         totalYAmount: totalYLamports,
         strategy: { minBinId, maxBinId, strategyType },
-        slippage: 10, // 10%
+        slippage: computeDynamicSlippage(normalizedVolatility),
       });
       const addTxArray = Array.isArray(addTxs) ? addTxs : [addTxs];
       for (let i = 0; i < addTxArray.length; i++) {
@@ -813,7 +843,7 @@ export async function deployPosition({
         totalXAmount: totalXLamports,
         totalYAmount: totalYLamports,
         strategy: { maxBinId, minBinId, strategyType },
-        slippage: 1000, // 10% in bps
+        slippage: computeDynamicSlippage(normalizedVolatility),
       });
       const txHash = await sendAndConfirmTransaction(getConnection(), tx, [wallet, newPosition]);
       txHashes.push(txHash);
@@ -1516,6 +1546,7 @@ export async function closePosition({ position_address, reason }) {
     const poolMeta = await getPoolMetadata(poolAddress);
     if (shouldUseLpAgentRelay()) {
       let relaySubmitted = false;
+      let livePosition = null;
       try {
       const pool = await getPool(poolAddress);
       const relayAllowedDebitMints = [
@@ -1524,7 +1555,7 @@ export async function closePosition({ position_address, reason }) {
         config.tokens.SOL,
       ];
       const livePositions = await getMyPositions({ force: true, silent: true });
-      const livePosition = livePositions?.positions?.find((position) => position.position === position_address);
+      livePosition = livePositions?.positions?.find((position) => position.position === position_address);
       const closeFromBinId = livePosition?.lower_bin ?? tracked?.bin_range?.min ?? -887272;
       const closeToBinId = livePosition?.upper_bin ?? tracked?.bin_range?.max ?? 887272;
       const closeOutput = "allToken1";

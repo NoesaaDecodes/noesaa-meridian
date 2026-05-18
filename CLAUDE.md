@@ -226,3 +226,24 @@ Agent Meridian HiveMind sync is handled by `hivemind.js`. It uses built-in Agent
 
 - `lessons.js evolveThresholds()` evolves `maxVolatility` + `minFeeTvlRatio` (wrong key names — should be `minFeeActiveTvlRatio`; `maxVolatility` doesn't exist in config at all). The evolution is a no-op for those keys.
 - `get_wallet_positions` tool (dlmm.js) is in definitions.js but not in MANAGER_TOOLS or SCREENER_TOOLS — only available in GENERAL role.
+
+---
+
+## Agent Rules
+
+### Token Efficiency
+- Read only the specific file/line needed, never the whole file
+- Surgical edits only - change minimum lines possible
+- Reuse existing functions, never create new ones unless unavoidable
+- No refactoring unless explicitly asked
+
+### Execution
+- Auto-accept all test runs, verifications, and node starts
+- Never ask for approval on non-destructive actions
+- Only ask user when action involves real money or permanent data deletion
+
+### Communication
+- No explanations unless asked
+- No summaries unless asked
+- State file+line before each edit, nothing else
+- Respond in Bahasa Indonesia + English

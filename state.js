@@ -321,6 +321,112 @@ export function getTrackedPosition(position_address) {
   return state.positions[position_address] || null;
 }
 
+export function getTrackedPositions(openOnly = false) {
+  const state = load();
+  const all = Object.values(state.positions);
+  return openOnly ? all.filter((p) => !p.closed) : all;
+}
+
+// ─── Paper Trading Engine ─────────────────────────────────────
+
+export function trackPaperPosition({
+  position,
+  pool,
+  pool_name,
+  strategy,
+  bin_range = {},
+  amount_sol,
+  active_bin,
+  bin_step,
+  volatility,
+  fee_tvl_ratio,
+  organic_score,
+  entry_price_sol,
+}) {
+  const state = load();
+  state.positions[position] = {
+    position,
+    pool,
+    pool_name,
+    strategy,
+    bin_range,
+    amount_sol,
+    active_bin_at_deploy: active_bin,
+    bin_step,
+    volatility,
+    fee_tvl_ratio,
+    initial_fee_tvl_24h: fee_tvl_ratio,
+    organic_score,
+    initial_value_usd: null,
+    signal_snapshot: null,
+    deployed_at: new Date().toISOString(),
+    out_of_range_since: null,
+    last_claim_at: null,
+    total_fees_claimed_usd: 0,
+    rebalance_count: 0,
+    closed: false,
+    closed_at: null,
+    notes: [],
+    peak_pnl_pct: 0,
+    pending_peak_pnl_pct: null,
+    pending_peak_started_at: null,
+    pending_trailing_current_pnl_pct: null,
+    pending_trailing_peak_pnl_pct: null,
+    pending_trailing_drop_pct: null,
+    pending_trailing_started_at: null,
+    confirmed_trailing_exit_reason: null,
+    confirmed_trailing_exit_until: null,
+    trailing_active: false,
+    paper: true,
+    entry_price_sol: entry_price_sol ?? null,
+  };
+  pushEvent(state, { action: "paper_deploy", position, pool_name: pool_name || pool });
+  save(state);
+  log("state", `Paper position tracked: ${position} in pool ${pool}`);
+}
+
+export function getPaperPositions(openOnly = true) {
+  const state = load();
+  const all = Object.values(state.positions).filter((p) => p.paper);
+  return openOnly ? all.filter((p) => !p.closed) : all;
+}
+
+export function closePaperPosition(position_address, reason, pnl_pct, pnl_sol) {
+  const state = load();
+  const pos = state.positions[position_address];
+  if (!pos || !pos.paper) return null;
+  pos.closed = true;
+  pos.closed_at = new Date().toISOString();
+  pos.close_reason = reason || "agent decision";
+  pos.paper_pnl_pct = pnl_pct;
+  pos.paper_pnl_sol = pnl_sol;
+  pos.notes.push(`Paper closed: ${reason} | PnL: ${pnl_pct?.toFixed(2)}% (${pnl_sol?.toFixed(6)} SOL)`);
+  pushEvent(state, { action: "paper_close", position: position_address, pnl_pct, pnl_sol, reason });
+  save(state);
+  log("state", `Paper position closed: ${position_address} — ${reason} — PnL ${pnl_pct?.toFixed(2)}%`);
+  return pos;
+}
+
+export function getPaperPnlSummary() {
+  const all = getPaperPositions(false);
+  const closed = all.filter((p) => p.closed);
+  const open = all.filter((p) => !p.closed);
+  const totalPnlSol = closed.reduce((s, p) => s + (p.paper_pnl_sol || 0), 0);
+  const winners = closed.filter((p) => (p.paper_pnl_pct || 0) > 0);
+  const losers = closed.filter((p) => (p.paper_pnl_pct || 0) < 0);
+  return {
+    open_count: open.length,
+    closed_count: closed.length,
+    total_pnl_sol: Math.round(totalPnlSol * 1e9) / 1e9,
+    win_rate: closed.length > 0 ? Math.round(winners.length / closed.length * 100) : 0,
+    avg_win: winners.length > 0 ? winners.reduce((s, p) => s + (p.paper_pnl_pct || 0), 0) / winners.length : 0,
+    avg_loss: losers.length > 0 ? losers.reduce((s, p) => s + (p.paper_pnl_pct || 0), 0) / losers.length : 0,
+    recent: closed.slice(-5).map((p) => ({
+      pair: p.pool_name, reason: p.close_reason, pnl_pct: p.paper_pnl_pct, pnl_sol: p.paper_pnl_sol,
+    })),
+  };
+}
+
 /**
  * Summarize state for the agent system prompt.
  */
