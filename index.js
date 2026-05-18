@@ -34,7 +34,7 @@ import {
   createLiveMessage,
 } from "./telegram.js";
 import { generateBriefing } from "./briefing.js";
-import { getLastBriefingDate, setLastBriefingDate, getTrackedPosition, getTrackedPositions, setPositionInstruction, updatePnlAndCheckExits, queuePeakConfirmation, resolvePendingPeak, queueTrailingDropConfirmation, resolvePendingTrailingDrop, trackPaperPosition, getPaperPositions, closePaperPosition, getPaperPnlSummary, updatePaperPositionPnl, initPaperAccount, getPaperAccount, computePaperDeployAmount, canOpenPaperPosition } from "./state.js";
+import { getLastBriefingDate, setLastBriefingDate, getTrackedPosition, getTrackedPositions, setPositionInstruction, updatePnlAndCheckExits, queuePeakConfirmation, resolvePendingPeak, queueTrailingDropConfirmation, resolvePendingTrailingDrop, trackPaperPosition, getPaperPositions, closePaperPosition, getPaperPnlSummary, updatePaperPositionPnl, initPaperAccount, getPaperAccount, computePaperDeployAmount, canOpenPaperPosition, getPaperHealthContext } from "./state.js";
 import { getActiveStrategy } from "./strategy-library.js";
 import { recordPositionSnapshot, recallForPool, addPoolNote } from "./pool-memory.js";
 import { checkSmartWalletsOnPool } from "./smart-wallets.js";
@@ -1045,6 +1045,14 @@ export function startCronJobs() {
     _managementBusy = true;
     log("cron", "Starting health check");
     try {
+      if (isPaperOnlyMode()) {
+        const health = getPaperHealthContext(paperOptions());
+        log(
+          "cron",
+          `Paper health check: virtual ${health.available_balance_sol} SOL available, ${health.deployed_balance_sol} SOL deployed, open ${health.open_positions}/${config.paper.maxOpenPositions}, closed ${health.lifecycle_report.total_closed}, realized ${health.realized_pnl_sol} SOL`,
+        );
+        return;
+      }
       await agentLoop(`
 HEALTH CHECK
 

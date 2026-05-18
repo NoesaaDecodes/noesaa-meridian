@@ -12,7 +12,13 @@ import {
 import { getWalletBalances, swapToken } from "./wallet.js";
 import { studyTopLPers } from "./study.js";
 import { addLesson, clearAllLessons, clearPerformance, removeLessonsByKeyword, getPerformanceHistory, pinLesson, unpinLesson, listLessons } from "../lessons.js";
-import { setPositionInstruction } from "../state.js";
+import {
+  canOpenPaperPosition,
+  computePaperDeployAmount,
+  getPaperAccount,
+  getPaperPositions,
+  setPositionInstruction,
+} from "../state.js";
 
 import { getPoolMemory, addPoolNote } from "../pool-memory.js";
 import { addStrategy, listStrategies, getStrategy, setActiveStrategy, removeStrategy } from "../strategy-library.js";
@@ -43,6 +49,49 @@ const TIMEFRAME_MINUTES = {
 };
 import { log, logAction } from "../logger.js";
 import { notifyDeploy, notifyClose, notifySwap } from "../telegram.js";
+
+function isPaperOnlyMode() {
+  return process.env.PAPER_ONLY === "true" || config.paper?.enabled === true;
+}
+
+function paperOptions() {
+  return {
+    startingBalanceSol: config.paper.startingBalanceSol,
+    maxOpenPositions: config.paper.maxOpenPositions,
+    positionSizePct: config.paper.positionSizePct,
+    minDeploySol: config.paper.minDeploySol,
+    maxDeploySol: config.paper.maxDeploySol,
+    gasReserveSol: config.paper.gasReserveSol,
+    cooldownMinutesAfterClose: config.paper.cooldownMinutesAfterClose,
+  };
+}
+
+function getPaperWalletBalance() {
+  const options = paperOptions();
+  const account = getPaperAccount({ startingBalanceSol: options.startingBalanceSol });
+  return {
+    paper_only: true,
+    sol: account.available_balance_sol,
+    virtual_balance_sol: account.available_balance_sol,
+    available_balance_sol: account.available_balance_sol,
+    deployed_balance_sol: account.deployed_balance_sol,
+    starting_balance_sol: account.starting_balance_sol,
+    realized_pnl_sol: account.realized_pnl_sol,
+    deploy_amount_sol: computePaperDeployAmount(options),
+    tokens: [],
+    note: "PAPER_ONLY virtual balance. Live wallet balance was not queried.",
+  };
+}
+
+function getPaperPositionsResult() {
+  const positions = getPaperPositions(true);
+  return {
+    paper_only: true,
+    total_positions: positions.length,
+    positions,
+    note: "PAPER_ONLY virtual positions. Live portfolio was not queried.",
+  };
+}
 
 function numberOrNull(value) {
   const n = Number(value);
@@ -567,6 +616,18 @@ export async function executeTool(name, args) {
     return { error };
   }
 
+  if (isPaperOnlyMode()) {
+    if (name === "get_wallet_balance") return getPaperWalletBalance();
+    if (name === "get_my_positions") return getPaperPositionsResult();
+    if (name === "deploy_position") {
+      process.env.DRY_RUN = "true";
+      args = { ...(args || {}) };
+      if (args.amount_y == null && args.amount_sol == null) {
+        args.amount_y = computePaperDeployAmount(paperOptions());
+      }
+    }
+  }
+
   // ─── Pre-execution safety checks ──────────
   if (PROTECTED_TOOLS.has(name)) {
     const safetyCheck = await runSafetyChecks(name, args);
@@ -772,6 +833,33 @@ async function runSafetyChecks(name, args) {
           pass: false,
           reason: `Must provide a positive SOL amount (amount_y).`,
         };
+      }
+
+      if (isPaperOnlyMode()) {
+        const options = paperOptions();
+        if (amountY < options.minDeploySol) {
+          return {
+            pass: false,
+            reason: `Paper amount ${amountY} SOL is below configured minimum ${options.minDeploySol} SOL.`,
+          };
+        }
+        if (amountY > options.maxDeploySol) {
+          return {
+            pass: false,
+            reason: `Paper amount ${amountY} SOL exceeds configured maximum ${options.maxDeploySol} SOL.`,
+          };
+        }
+        const paperCheck = canOpenPaperPosition(
+          { pool: args.pool_address, amount_sol: amountY },
+          options,
+        );
+        if (!paperCheck.ok) {
+          return {
+            pass: false,
+            reason: paperCheck.reason,
+          };
+        }
+        return { pass: true };
       }
 
       const minDeploy = Math.max(0.1, config.management.deployAmountSol);

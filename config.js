@@ -65,11 +65,11 @@ export const config = {
 
   paper: {
     enabled: process.env.PAPER_ONLY === "true" || u.paperOnly === true,
-    startingBalanceSol: Number(process.env.PAPER_STARTING_BALANCE_SOL ?? u.paperStartingBalanceSol ?? 5),
-    maxOpenPositions: Number(process.env.PAPER_MAX_OPEN_POSITIONS ?? u.paperMaxOpenPositions ?? u.maxPaperPositions ?? u.maxPositions ?? 3),
-    positionSizePct: Number(process.env.PAPER_POSITION_SIZE_PCT ?? u.paperPositionSizePct ?? u.positionSizePct ?? 0.35),
-    minDeploySol: Number(process.env.PAPER_MIN_DEPLOY_SOL ?? u.paperMinDeploySol ?? u.deployAmountSol ?? 0.5),
-    maxDeploySol: Number(process.env.PAPER_MAX_DEPLOY_SOL ?? u.paperMaxDeploySol ?? u.maxDeployAmount ?? 50),
+    startingBalanceSol: Number(process.env.PAPER_STARTING_BALANCE_SOL ?? u.paperStartingBalanceSol ?? 0.5),
+    maxOpenPositions: Number(process.env.PAPER_MAX_OPEN_POSITIONS ?? u.paperMaxOpenPositions ?? u.maxPaperPositions ?? 2),
+    positionSizePct: Number(process.env.PAPER_POSITION_SIZE_PCT ?? u.paperPositionSizePct ?? 0.2),
+    minDeploySol: Number(process.env.PAPER_MIN_DEPLOY_SOL ?? u.paperMinDeploySol ?? 0.05),
+    maxDeploySol: Number(process.env.PAPER_MAX_DEPLOY_SOL ?? u.paperMaxDeploySol ?? 0.1),
     gasReserveSol: Number(process.env.PAPER_GAS_RESERVE_SOL ?? u.paperGasReserveSol ?? 0),
     cooldownMinutesAfterClose: Number(process.env.PAPER_POOL_COOLDOWN_MINUTES ?? u.paperPoolCooldownMinutes ?? 60),
   },

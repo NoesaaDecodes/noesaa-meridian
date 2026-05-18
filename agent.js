@@ -87,7 +87,7 @@ import { getWalletBalances } from "./tools/wallet.js";
 import { getMyPositions } from "./tools/dlmm.js";
 import { log } from "./logger.js";
 import { config } from "./config.js";
-import { getStateSummary } from "./state.js";
+import { computePaperDeployAmount, getPaperAccount, getPaperPositions, getStateSummary } from "./state.js";
 import { getLessonsForPrompt, getPerformanceSummary } from "./lessons.js";
 import { getDecisionSummary } from "./decision-log.js";
 
@@ -132,6 +132,47 @@ function buildMessages(systemPrompt, sessionHistory, goal, providerMode = "syste
   ];
 }
 
+function isPaperOnlyMode() {
+  return process.env.PAPER_ONLY === "true" || config.paper?.enabled === true;
+}
+
+function paperOptions() {
+  return {
+    startingBalanceSol: config.paper.startingBalanceSol,
+    maxOpenPositions: config.paper.maxOpenPositions,
+    positionSizePct: config.paper.positionSizePct,
+    minDeploySol: config.paper.minDeploySol,
+    maxDeploySol: config.paper.maxDeploySol,
+    gasReserveSol: config.paper.gasReserveSol,
+    cooldownMinutesAfterClose: config.paper.cooldownMinutesAfterClose,
+  };
+}
+
+function getPaperPortfolioForPrompt() {
+  const options = paperOptions();
+  const account = getPaperAccount({ startingBalanceSol: options.startingBalanceSol });
+  return {
+    paper_only: true,
+    sol: account.available_balance_sol,
+    virtual_balance_sol: account.available_balance_sol,
+    available_balance_sol: account.available_balance_sol,
+    deployed_balance_sol: account.deployed_balance_sol,
+    starting_balance_sol: account.starting_balance_sol,
+    realized_pnl_sol: account.realized_pnl_sol,
+    deploy_amount_sol: computePaperDeployAmount(options),
+    note: "PAPER_ONLY virtual account. Do not infer live wallet funding needs from this context.",
+  };
+}
+
+function getPaperPositionsForPrompt() {
+  const open = getPaperPositions(true);
+  return {
+    paper_only: true,
+    total_positions: open.length,
+    positions: open,
+  };
+}
+
 function isSystemRoleError(error) {
   const message = String(error?.message || error?.error?.message || error || "");
   return /invalid message role:\s*system/i.test(message);
@@ -152,7 +193,9 @@ function isToolChoiceRequiredError(error) {
 export async function agentLoop(goal, maxSteps = config.llm.maxSteps, sessionHistory = [], agentType = "GENERAL", model = null, maxOutputTokens = null, options = {}) {
   const { interactive = false, onToolStart = null, onToolFinish = null } = options;
   // Build dynamic system prompt with current portfolio state
-  const [portfolio, positions] = await Promise.all([getWalletBalances(), getMyPositions()]);
+  const [portfolio, positions] = isPaperOnlyMode()
+    ? [getPaperPortfolioForPrompt(), getPaperPositionsForPrompt()]
+    : await Promise.all([getWalletBalances(), getMyPositions()]);
   const stateSummary = getStateSummary();
   const lessons = getLessonsForPrompt({ agentType });
   const perfSummary = getPerformanceSummary();

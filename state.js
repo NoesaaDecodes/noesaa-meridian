@@ -561,7 +561,7 @@ export function getPaperLifecycleHistory(limit = null) {
 
 function ensurePaperAccount(state, options = {}) {
   if (!state.paperAccount) {
-    const startingBalanceSol = round(options.startingBalanceSol ?? 5, 9) ?? 5;
+    const startingBalanceSol = round(options.startingBalanceSol ?? 0.5, 9) ?? 0.5;
     state.paperAccount = {
       starting_balance_sol: startingBalanceSol,
       available_balance_sol: startingBalanceSol,
@@ -615,6 +615,26 @@ export function computePaperDeployAmount(options = {}) {
   if (deployable < floor) return 0;
   const dynamic = deployable * pct;
   return round(Math.min(ceil, Math.max(floor, dynamic)), 2);
+}
+
+export function getPaperHealthContext(options = {}) {
+  const account = getPaperAccount({ startingBalanceSol: options.startingBalanceSol });
+  const openPositions = getPaperPositions(true);
+  const pnlSummary = getPaperPnlSummary();
+  const lifecycleReport = getPaperLifecycleReport(10);
+  return {
+    paper_only: true,
+    virtual_balance_sol: account.available_balance_sol,
+    available_balance_sol: account.available_balance_sol,
+    deployed_balance_sol: account.deployed_balance_sol,
+    starting_balance_sol: account.starting_balance_sol,
+    realized_pnl_sol: account.realized_pnl_sol,
+    open_positions: openPositions.length,
+    max_open_positions: options.maxOpenPositions ?? null,
+    deploy_amount_sol: computePaperDeployAmount(options),
+    pnl_summary: pnlSummary,
+    lifecycle_report: lifecycleReport,
+  };
 }
 
 export function canOpenPaperPosition({ pool, amount_sol }, options = {}) {

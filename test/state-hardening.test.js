@@ -45,6 +45,7 @@ function trackPaper(position = "paper_test_position") {
       narrative_strength: "strong",
       narrative_quality: "present",
     },
+    paper_options: { startingBalanceSol: 2, maxOpenPositions: 3 },
   });
 }
 
