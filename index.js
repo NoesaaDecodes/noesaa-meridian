@@ -466,6 +466,7 @@ export async function runManagementCycle({ silent = false } = {}) {
             minutes_held: p.age_minutes ?? 0,
             close_reason: `paper: ${act.reason || "rule"}`,
             signal_snapshot: closed.signal_snapshot || null,
+            paper_lifecycle: closed.paper_lifecycle || null,
           }).catch((e) => log("paper_warn", `Failed to record paper performance: ${e.message}`));
           log("paper", `Paper closed: ${p.pair} — ${act.reason} — PnL ${pnlPct.toFixed(2)}% (${pnlSol} SOL)`);
           mgmtReport += `\n📄 Paper closed: ${p.pair} | ${act.reason} | PnL ${pnlPct.toFixed(2)}% (${pnlSol} SOL)`;

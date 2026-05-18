@@ -11,10 +11,11 @@
 import fs from "fs";
 import { log } from "./logger.js";
 
-const STATE_FILE = "./state.json";
+const STATE_FILE = process.env.MERIDIAN_STATE_FILE || "./state.json";
 
 const MAX_RECENT_EVENTS = 20;
 const MAX_INSTRUCTION_LENGTH = 280;
+const MAX_PAPER_LIFECYCLE_HISTORY = 500;
 
 function isFiniteNumber(value) {
   return typeof value === "number" && Number.isFinite(value);
@@ -22,6 +23,119 @@ function isFiniteNumber(value) {
 
 function formatPct(value) {
   return isFiniteNumber(value) ? `${value.toFixed(2)}%` : "unavailable";
+}
+
+function round(value, digits = 4) {
+  if (!isFiniteNumber(value)) return null;
+  const factor = 10 ** digits;
+  return Math.round(value * factor) / factor;
+}
+
+function minutesBetween(start, end) {
+  if (!start || !end) return null;
+  const ms = new Date(end).getTime() - new Date(start).getTime();
+  return Number.isFinite(ms) && ms >= 0 ? Math.floor(ms / 60000) : null;
+}
+
+function getEntrySignalValue(pos, field) {
+  return pos?.paper_entry_signals?.[field] ?? pos?.signal_snapshot?.[field] ?? null;
+}
+
+function computeVolumeDecayPct(entryVolume, latestVolume) {
+  if (!isFiniteNumber(entryVolume) || entryVolume <= 0 || !isFiniteNumber(latestVolume)) return null;
+  return round(((entryVolume - latestVolume) / entryVolume) * 100, 2);
+}
+
+function updatePaperRangeAccounting(pos, now, inRange) {
+  if (typeof inRange !== "boolean") return;
+  if (inRange) {
+    if (pos.paper_out_of_range_since) {
+      const started = new Date(pos.paper_out_of_range_since).getTime();
+      const ended = new Date(now).getTime();
+      if (Number.isFinite(started) && Number.isFinite(ended) && ended >= started) {
+        pos.paper_out_of_range_total_ms = (pos.paper_out_of_range_total_ms || 0) + (ended - started);
+      }
+      pos.paper_out_of_range_since = null;
+    }
+  } else if (!pos.paper_out_of_range_since) {
+    pos.paper_out_of_range_since = now;
+  }
+}
+
+function finalizePaperRangeAccounting(pos, closedAt) {
+  if (!pos.paper_out_of_range_since) return;
+  const started = new Date(pos.paper_out_of_range_since).getTime();
+  const ended = new Date(closedAt).getTime();
+  if (Number.isFinite(started) && Number.isFinite(ended) && ended >= started) {
+    pos.paper_out_of_range_total_ms = (pos.paper_out_of_range_total_ms || 0) + (ended - started);
+  }
+  pos.paper_out_of_range_since = null;
+}
+
+function buildPaperLifecycleRecord(pos) {
+  const entryTimestamp = pos.deployed_at ?? null;
+  const closeTimestamp = pos.closed_at ?? null;
+  const entryVolume = getEntrySignalValue(pos, "volume");
+  const latestVolume = pos.last_paper_volume ?? entryVolume ?? null;
+  const realizedPnlPct = isFiniteNumber(pos.paper_pnl_pct) ? pos.paper_pnl_pct : pos.last_paper_pnl_pct ?? null;
+  const holdMinutes = minutesBetween(entryTimestamp, closeTimestamp);
+  const oorMinutes = isFiniteNumber(pos.paper_out_of_range_total_ms)
+    ? Math.floor(pos.paper_out_of_range_total_ms / 60000)
+    : 0;
+
+  return {
+    id: `paper_lifecycle_${pos.position}_${closeTimestamp || Date.now()}`,
+    position: pos.position,
+    pool: pos.pool,
+    pool_name: pos.pool_name || pos.pool,
+    strategy: pos.strategy || null,
+    entry_timestamp: entryTimestamp,
+    close_timestamp: closeTimestamp,
+    hold_duration_minutes: holdMinutes,
+    max_unrealized_pnl_pct: round(pos.paper_max_unrealized_pnl_pct ?? realizedPnlPct, 2),
+    min_unrealized_pnl_pct: round(pos.paper_min_unrealized_pnl_pct ?? realizedPnlPct, 2),
+    realized_pnl_pct: round(realizedPnlPct, 2),
+    realized_pnl_sol: round(pos.paper_pnl_sol, 9),
+    close_reason: pos.close_reason || null,
+    trailing_stop_used: Boolean(
+      pos.paper_trailing_stop_used ||
+      String(pos.close_reason || "").toLowerCase().includes("trailing")
+    ),
+    out_of_range_duration_minutes: oorMinutes,
+    volume_at_entry: round(entryVolume, 4),
+    volume_at_close: round(latestVolume, 4),
+    volume_decay_pct: computeVolumeDecayPct(entryVolume, latestVolume),
+    smart_wallet_score_at_entry: round(getEntrySignalValue(pos, "smart_wallet_score"), 4),
+    smart_wallets_present_at_entry: getEntrySignalValue(pos, "smart_wallets_present"),
+    narrative_strength_at_entry: getEntrySignalValue(pos, "narrative_strength") ?? getEntrySignalValue(pos, "narrative_quality"),
+    entry_quality: {
+      organic_score: round(pos.organic_score, 2),
+      fee_tvl_ratio: round(pos.fee_tvl_ratio, 4),
+      volatility: round(pos.volatility, 4),
+      entry_price_sol: round(pos.entry_price_sol, 12),
+    },
+    hold_quality: {
+      pnl_range_pct: isFiniteNumber(pos.paper_max_unrealized_pnl_pct) && isFiniteNumber(pos.paper_min_unrealized_pnl_pct)
+        ? round(pos.paper_max_unrealized_pnl_pct - pos.paper_min_unrealized_pnl_pct, 2)
+        : null,
+      range_efficiency_pct: holdMinutes > 0 ? round(((holdMinutes - oorMinutes) / holdMinutes) * 100, 2) : null,
+      failed_refresh_count: pos.paper_failed_refresh_count || 0,
+    },
+    exit_quality: {
+      gave_back_from_peak_pct: isFiniteNumber(pos.paper_max_unrealized_pnl_pct) && isFiniteNumber(realizedPnlPct)
+        ? round(pos.paper_max_unrealized_pnl_pct - realizedPnlPct, 2)
+        : null,
+      closed_below_entry: isFiniteNumber(realizedPnlPct) ? realizedPnlPct < 0 : null,
+    },
+  };
+}
+
+function appendPaperLifecycle(state, record) {
+  if (!state.paperLifecycleHistory) state.paperLifecycleHistory = [];
+  state.paperLifecycleHistory.push(record);
+  if (state.paperLifecycleHistory.length > MAX_PAPER_LIFECYCLE_HISTORY) {
+    state.paperLifecycleHistory = state.paperLifecycleHistory.slice(-MAX_PAPER_LIFECYCLE_HISTORY);
+  }
 }
 
 function sanitizeStoredText(text, maxLen = MAX_INSTRUCTION_LENGTH) {
@@ -362,8 +476,20 @@ export function trackPaperPosition({
   fee_tvl_ratio,
   organic_score,
   entry_price_sol,
+  signal_snapshot = null,
+  smart_wallet_score = null,
+  narrative_strength = null,
+  entry_volume = null,
 }) {
   const state = load();
+  const paperEntrySignals = {
+    ...(signal_snapshot || {}),
+    volume: entry_volume ?? signal_snapshot?.volume ?? null,
+    smart_wallet_score: smart_wallet_score ?? signal_snapshot?.smart_wallet_score ?? null,
+    smart_wallets_present: signal_snapshot?.smart_wallets_present ?? null,
+    narrative_strength: narrative_strength ?? signal_snapshot?.narrative_strength ?? null,
+    narrative_quality: signal_snapshot?.narrative_quality ?? null,
+  };
   state.positions[position] = {
     position,
     pool,
@@ -378,7 +504,8 @@ export function trackPaperPosition({
     initial_fee_tvl_24h: fee_tvl_ratio,
     organic_score,
     initial_value_usd: null,
-    signal_snapshot: null,
+    signal_snapshot: signal_snapshot || null,
+    paper_entry_signals: paperEntrySignals,
     deployed_at: new Date().toISOString(),
     out_of_range_since: null,
     last_claim_at: null,
@@ -399,6 +526,12 @@ export function trackPaperPosition({
     trailing_active: false,
     paper: true,
     entry_price_sol: entry_price_sol ?? null,
+    paper_max_unrealized_pnl_pct: null,
+    paper_min_unrealized_pnl_pct: null,
+    paper_out_of_range_total_ms: 0,
+    paper_out_of_range_since: null,
+    paper_failed_refresh_count: 0,
+    last_paper_volume: entry_volume ?? signal_snapshot?.volume ?? null,
   };
   pushEvent(state, { action: "paper_deploy", position, pool_name: pool_name || pool });
   save(state);
@@ -411,19 +544,39 @@ export function getPaperPositions(openOnly = true) {
   return openOnly ? all.filter((p) => !p.closed) : all;
 }
 
+export function getPaperLifecycleHistory(limit = 50) {
+  const state = load();
+  const history = state.paperLifecycleHistory || [];
+  return history.slice(-limit);
+}
+
 export function closePaperPosition(position_address, reason, pnl_pct, pnl_sol) {
   const state = load();
   const pos = state.positions[position_address];
   if (!pos || !pos.paper) return null;
+  const finalPnlPct = isFiniteNumber(pnl_pct) ? pnl_pct : pos.last_paper_pnl_pct ?? null;
   pos.closed = true;
   pos.closed_at = new Date().toISOString();
   pos.close_reason = reason || "agent decision";
-  pos.paper_pnl_pct = pnl_pct;
-  pos.paper_pnl_sol = pnl_sol;
-  pos.notes.push(`Paper closed: ${reason} | PnL: ${pnl_pct?.toFixed(2)}% (${pnl_sol?.toFixed(6)} SOL)`);
-  pushEvent(state, { action: "paper_close", position: position_address, pnl_pct, pnl_sol, reason });
+  pos.paper_pnl_pct = finalPnlPct;
+  pos.paper_pnl_sol = isFiniteNumber(pnl_sol) ? pnl_sol : null;
+  if (isFiniteNumber(finalPnlPct)) {
+    pos.paper_max_unrealized_pnl_pct = isFiniteNumber(pos.paper_max_unrealized_pnl_pct)
+      ? Math.max(pos.paper_max_unrealized_pnl_pct, finalPnlPct)
+      : finalPnlPct;
+    pos.paper_min_unrealized_pnl_pct = isFiniteNumber(pos.paper_min_unrealized_pnl_pct)
+      ? Math.min(pos.paper_min_unrealized_pnl_pct, finalPnlPct)
+      : finalPnlPct;
+  }
+  pos.paper_trailing_stop_used = String(pos.close_reason || "").toLowerCase().includes("trailing");
+  finalizePaperRangeAccounting(pos, pos.closed_at);
+  const lifecycle = buildPaperLifecycleRecord(pos);
+  pos.paper_lifecycle = lifecycle;
+  appendPaperLifecycle(state, lifecycle);
+  pos.notes.push(`Paper closed: ${reason} | PnL: ${formatPct(finalPnlPct)} (${pos.paper_pnl_sol?.toFixed(6) ?? "?"} SOL)`);
+  pushEvent(state, { action: "paper_close", position: position_address, pnl_pct: finalPnlPct, pnl_sol: pos.paper_pnl_sol, reason });
   save(state);
-  log("state", `Paper position closed: ${position_address} — ${reason} — PnL ${pnl_pct?.toFixed(2)}%`);
+  log("state", `Paper position closed: ${position_address} - ${reason} - PnL ${formatPct(finalPnlPct)} | hold ${lifecycle.hold_duration_minutes ?? "?"}m | max ${formatPct(lifecycle.max_unrealized_pnl_pct)} | min ${formatPct(lifecycle.min_unrealized_pnl_pct)}`);
   return pos;
 }
 
@@ -432,6 +585,7 @@ export function updatePaperPositionPnl(position_address, {
   current_price_sol,
   active_bin,
   in_range,
+  volume,
   refresh_error = null,
 } = {}) {
   const state = load();
@@ -441,12 +595,21 @@ export function updatePaperPositionPnl(position_address, {
   const now = new Date().toISOString();
   if (isFiniteNumber(pnl_pct)) {
     pos.last_paper_pnl_pct = pnl_pct;
+    pos.paper_max_unrealized_pnl_pct = isFiniteNumber(pos.paper_max_unrealized_pnl_pct)
+      ? Math.max(pos.paper_max_unrealized_pnl_pct, pnl_pct)
+      : pnl_pct;
+    pos.paper_min_unrealized_pnl_pct = isFiniteNumber(pos.paper_min_unrealized_pnl_pct)
+      ? Math.min(pos.paper_min_unrealized_pnl_pct, pnl_pct)
+      : pnl_pct;
     pos.last_paper_price_sol = isFiniteNumber(current_price_sol) ? current_price_sol : pos.last_paper_price_sol ?? null;
     pos.last_paper_active_bin = active_bin ?? pos.last_paper_active_bin ?? null;
     pos.last_paper_in_range = typeof in_range === "boolean" ? in_range : pos.last_paper_in_range ?? true;
+    if (isFiniteNumber(volume)) pos.last_paper_volume = volume;
+    updatePaperRangeAccounting(pos, now, in_range);
     pos.last_paper_pnl_at = now;
     pos.last_paper_pnl_error = null;
   } else if (refresh_error) {
+    pos.paper_failed_refresh_count = (pos.paper_failed_refresh_count || 0) + 1;
     pos.last_paper_pnl_error = sanitizeStoredText(refresh_error, 180);
     pos.last_paper_pnl_error_at = now;
   }
