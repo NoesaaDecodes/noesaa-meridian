@@ -74,6 +74,24 @@ test("paper prompt explicitly prevents live wallet funding recommendations", () 
   assert.doesNotMatch(prompt, /fund your wallet/i);
 });
 
+test("telegram concise prompt requests tactical operator replies", () => {
+  const prompt = buildSystemPrompt(
+    "GENERAL",
+    { paper_only: true, sol: 0.5, virtual_balance_sol: 0.5 },
+    { paper_only: true, total_positions: 0, positions: [] },
+    null,
+    null,
+    null,
+    null,
+    null,
+    { telegramConcise: true },
+  );
+
+  assert.match(prompt, /TELEGRAM OPERATOR REPLY MODE/);
+  assert.match(prompt, /Prioritize: action, reason, key metrics, next recommendation/);
+  assert.match(prompt, /Maximum \d+ lines/);
+});
+
 test("paper health context is independent of live wallet fetch", async () => {
   resetState();
   state.initPaperAccount({ startingBalanceSol: 0.5 });
