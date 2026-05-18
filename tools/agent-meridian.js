@@ -64,6 +64,7 @@ async function agentMeridianJsonOnce(pathname, options = {}, timeoutMs = null) {
   }
   if (!res.ok) {
     const error = new Error(payload?.error || `${pathname} ${res.status}`);
+    error.provider = "Agent Meridian";
     error.status = res.status;
     error.payload = payload;
     error.retryAfter = res.headers.get("retry-after");

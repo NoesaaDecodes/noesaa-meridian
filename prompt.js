@@ -36,6 +36,7 @@ function buildTelegramConciseBlock(options = {}) {
 - Prioritize: action, reason, key metrics, next recommendation.
 - Avoid markdown sections, generic education, repeated explanations, and "what this means" commentary.
 - If diagnostics are needed, name only the main blocker and the immediate next step.
+- Never classify 401/403, invalid API key, or provider auth failures as candidate weakness. Label them INFRA/AUTH.
 `;
 }
 

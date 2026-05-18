@@ -11,7 +11,7 @@ import {
 } from "@solana/web3.js";
 import BN from "bn.js";
 import bs58 from "bs58";
-import { config, computeDeployAmount, MIN_SAFE_BINS_BELOW } from "../config.js";
+import { classifyApiError, config, computeDeployAmount, MIN_SAFE_BINS_BELOW } from "../config.js";
 
 // ─── MEV Protection Helpers ────────────────────────────────────
 function computeDynamicSlippage(volatility) {
@@ -917,8 +917,16 @@ export async function deployPosition({
       txs: txHashes,
     };
   } catch (error) {
-    log("deploy_error", error.message);
-    return { success: false, error: error.message };
+    const classified = classifyApiError(error, error.provider || "deploy execution");
+    const isInfra = classified.infrastructureFailure;
+    log(isInfra ? "deploy_infra_error" : "deploy_error", isInfra ? classified.operatorMessage : error.message);
+    return {
+      success: false,
+      error: isInfra ? classified.operatorMessage : error.message,
+      type: isInfra ? "infrastructure_auth" : "deploy_failure",
+      provider: isInfra ? classified.provider : null,
+      authFailure: classified.authFailure,
+    };
   }
 }
 

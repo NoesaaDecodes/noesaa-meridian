@@ -19,7 +19,7 @@ process.env.PAPER_MIN_DEPLOY_SOL = "0.05";
 process.env.PAPER_MAX_DEPLOY_SOL = "0.1";
 
 const state = await import("../state.js");
-const { config } = await import("../config.js");
+const { classifyApiError, config, getDefaultMinFeeActiveTvlRatio } = await import("../config.js");
 const { buildSystemPrompt } = await import("../prompt.js");
 
 config.paper.enabled = true;
@@ -57,6 +57,70 @@ test("paper-start health context uses virtual balance", () => {
   assert.equal(health.available_balance_sol, 0.5);
   assert.equal(health.open_positions, 0);
   assert.equal(health.deploy_amount_sol, 0.1);
+});
+
+test("api auth errors are classified as infrastructure, not candidate failure", () => {
+  const error = new Error("401 Unauthorized invalid api key");
+  error.status = 401;
+  error.provider = "Agent Meridian OKX enrichment";
+
+  const classified = classifyApiError(error, error.provider);
+
+  assert.equal(classified.authFailure, true);
+  assert.equal(classified.infrastructureFailure, true);
+  assert.equal(classified.provider, "Agent Meridian OKX enrichment");
+  assert.match(classified.operatorMessage, /INFRA\/AUTH/);
+});
+
+test("paper deploy verification auth failure is blocked as infrastructure", () => {
+  resetState();
+  state.initPaperAccount({ startingBalanceSol: 0.5 });
+  const code = `
+    process.env.MERIDIAN_STATE_FILE = ${JSON.stringify(stateFile)};
+    process.env.PAPER_ONLY = "true";
+    process.env.DRY_RUN = "true";
+    process.env.PAPER_STARTING_BALANCE_SOL = "0.5";
+    process.env.PAPER_MIN_DEPLOY_SOL = "0.05";
+    process.env.PAPER_MAX_DEPLOY_SOL = "0.1";
+    globalThis.fetch = async () => ({
+      ok: false,
+      status: 401,
+      statusText: "Unauthorized",
+      async text() { return "invalid api key"; },
+      async json() { return { error: "invalid api key" }; },
+    });
+    const { executeTool } = await import(${JSON.stringify(pathToFileURL(path.resolve("tools/executor.js")).href)});
+    const result = await executeTool("deploy_position", {
+      pool_address: "Pool111111111111111111111111111111111111111",
+      amount_y: 0.05,
+      amount_x: 0,
+      bins_below: 35,
+      bins_above: 0,
+      volatility: 1,
+    });
+    console.log("RESULT:" + JSON.stringify(result));
+    process.exit(0);
+  `;
+  const child = spawnSync(process.execPath, ["--input-type=module", "-e", code], {
+    cwd: path.resolve("."),
+    encoding: "utf8",
+    env: { ...process.env },
+    timeout: 10_000,
+  });
+  assert.equal(child.status, 0, child.stderr || child.stdout);
+  const line = child.stdout.split(/\r?\n/).find((entry) => entry.startsWith("RESULT:"));
+  assert.ok(line, child.stdout);
+  const result = JSON.parse(line.slice("RESULT:".length));
+  assert.equal(result.blocked, true);
+  assert.equal(result.type, "infrastructure_auth");
+  assert.equal(result.authFailure, true);
+  assert.match(result.reason, /not a candidate rejection/i);
+});
+
+test("paper mode uses exploratory fee threshold without changing live default", () => {
+  assert.equal(getDefaultMinFeeActiveTvlRatio({ paperOnly: true, timeframe: "5m" }), 0.02);
+  assert.equal(getDefaultMinFeeActiveTvlRatio({ paperOnly: false, timeframe: "5m" }), 0.05);
+  assert.equal(getDefaultMinFeeActiveTvlRatio({ paperOnly: true, timeframe: "5m", configuredValue: 0.07 }), 0.07);
 });
 
 test("paper prompt explicitly prevents live wallet funding recommendations", () => {

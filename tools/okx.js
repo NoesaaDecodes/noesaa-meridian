@@ -4,7 +4,8 @@
  * Docs: https://web3.okx.com/build/dev-docs/
  */
 import crypto from "crypto";
-import { config } from "../config.js";
+import { classifyApiError, config } from "../config.js";
+import { log } from "../logger.js";
 
 const BASE = "https://web3.okx.com";
 const CHAIN_SOLANA = "501";
@@ -95,7 +96,10 @@ async function fetchServerOkxEnrichment(tokenAddress, chainIndex = CHAIN_SOLANA)
       const text = await res.text();
       const payload = text ? JSON.parse(text) : null;
       if (!res.ok) {
-        throw new Error(payload?.error || `Agent Meridian OKX enrichment ${res.status}`);
+        const error = new Error(payload?.error || `Agent Meridian OKX enrichment ${res.status}`);
+        error.provider = "Agent Meridian OKX enrichment";
+        error.status = res.status;
+        throw error;
       }
       return payload;
     })
@@ -112,7 +116,12 @@ async function getServerOkxEnrichmentOrNull(tokenAddress, chainIndex = CHAIN_SOL
   if (hasAuth()) return null;
   try {
     return await fetchServerOkxEnrichment(tokenAddress, chainIndex);
-  } catch {
+  } catch (error) {
+    const classified = classifyApiError(error, error.provider || "Agent Meridian OKX enrichment");
+    log(
+      classified.authFailure ? "api_auth" : "api_warn",
+      `${classified.operatorMessage} Falling back to direct/public OKX where possible.`,
+    );
     return null;
   }
 }

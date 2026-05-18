@@ -1,4 +1,4 @@
-import { config } from "../config.js";
+import { classifyApiError, config } from "../config.js";
 import { isBlacklisted } from "../token-blacklist.js";
 import { isDevBlocked, getBlockedDevs } from "../dev-blocklist.js";
 import { log } from "../logger.js";
@@ -149,7 +149,12 @@ async function fetchDiscordSignalCandidates() {
   const res = await fetch(`${getAgentMeridianBase()}/signals/discord/candidates`, {
     headers: getAgentMeridianHeaders(),
   });
-  if (!res.ok) throw new Error(`discord signal candidates ${res.status}`);
+  if (!res.ok) {
+    const error = new Error(`discord signal candidates ${res.status}`);
+    error.provider = "Agent Meridian Discord signals";
+    error.status = res.status;
+    throw error;
+  }
   const data = await res.json();
   return Array.isArray(data?.candidates) ? data.candidates : [];
 }
@@ -164,7 +169,10 @@ async function fetchPoolDiscoveryPage({ page_size, filters, timeframe, category 
   const res = await fetch(url);
 
   if (!res.ok) {
-    throw new Error(`Pool Discovery API error: ${res.status} ${res.statusText}`);
+    const error = new Error(`Pool Discovery API error: ${res.status} ${res.statusText}`);
+    error.provider = "Meteora Pool Discovery";
+    error.status = res.status;
+    throw error;
   }
 
   return res.json();
@@ -179,7 +187,10 @@ async function fetchPoolDiscoveryDetail({ poolAddress, timeframe }) {
   const res = await fetch(url);
 
   if (!res.ok) {
-    throw new Error(`Pool detail API error: ${res.status} ${res.statusText}`);
+    const error = new Error(`Pool detail API error: ${res.status} ${res.statusText}`);
+    error.provider = "Meteora Pool Discovery";
+    error.status = res.status;
+    throw error;
   }
 
   const data = await res.json();
@@ -377,7 +388,8 @@ export async function discoverPools({
 
   if (config.screening.useDiscordSignals) {
     const signalCandidates = await fetchDiscordSignalCandidates().catch((error) => {
-      log("screening", `Discord signal fetch failed: ${error.message}`);
+      const classified = classifyApiError(error, error.provider || "Agent Meridian Discord signals");
+      log(classified.authFailure ? "api_auth" : "screening", `${classified.operatorMessage} Discord signals disabled for this cycle.`);
       return [];
     });
     const signalPools = signalCandidates

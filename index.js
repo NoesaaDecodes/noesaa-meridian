@@ -8,7 +8,7 @@ import { log } from "./logger.js";
 import { getMyPositions, closePosition, getActiveBin } from "./tools/dlmm.js";
 import { getWalletBalances } from "./tools/wallet.js";
 import { getTopCandidates } from "./tools/screening.js";
-import { config, reloadScreeningThresholds, computeDeployAmount } from "./config.js";
+import { classifyApiError, config, getApiAuthWarnings, reloadScreeningThresholds, computeDeployAmount } from "./config.js";
 import { evolveThresholds, getPerformanceSummary } from "./lessons.js";
 import { executeTool, registerCronRestarter } from "./tools/executor.js";
 import {
@@ -58,8 +58,23 @@ if (isPaperOnlyMode()) {
   process.env.DRY_RUN = "true";
 }
 
+let _apiAuthWarningsLogged = false;
+function logApiAuthWarningsOnce() {
+  if (_apiAuthWarningsLogged) return;
+  _apiAuthWarningsLogged = true;
+  const warnings = getApiAuthWarnings();
+  if (warnings.length === 0) {
+    log("startup", "API auth check passed for configured providers.");
+    return;
+  }
+  for (const warning of warnings) {
+    log("api_auth_warn", `${warning.provider}: ${warning.reason} Secrets are not printed.`);
+  }
+}
+
 if (isMain) {
   log("startup", "DLMM LP Agent starting...");
+  logApiAuthWarningsOnce();
   if (isPaperOnlyMode()) {
     const account = initPaperAccount({ startingBalanceSol: config.paper.startingBalanceSol });
     log("startup", "PAPER MODE ENABLED - simulated lifecycle only, no on-chain transactions");
@@ -655,8 +670,12 @@ export async function runScreeningCycle({ silent = false } = {}) {
       return screenReport;
     }
   } catch (e) {
-    log("cron_error", `Screening pre-check failed: ${e.message}`);
-    screenReport = `Screening pre-check failed: ${e.message}`;
+    const classified = classifyApiError(e, e.provider || "screening pre-check");
+    const message = classified.infrastructureFailure
+      ? `${classified.operatorMessage} Screening pre-check stopped; not a candidate rejection.`
+      : `Screening pre-check failed: ${e.message}`;
+    log(classified.authFailure ? "api_auth" : "cron_error", message);
+    screenReport = message;
     notifyRuntimeError({ scope: "screening pre-check", error: e }).catch(() => {});
     _screeningBusy = false;
     return screenReport;
@@ -1007,8 +1026,11 @@ IMPORTANT:
       });
     }
   } catch (error) {
-    log("cron_error", `Screening cycle failed: ${error.message}`);
-    screenReport = `Screening cycle failed: ${error.message}`;
+    const classified = classifyApiError(error, error.provider || "screening");
+    screenReport = classified.infrastructureFailure
+      ? `${classified.operatorMessage} Screening stopped; not a candidate rejection.`
+      : `Screening cycle failed: ${error.message}`;
+    log(classified.authFailure ? "api_auth" : "cron_error", screenReport);
     notifyRuntimeError({ scope: "screening", error }).catch(() => {});
   } finally {
     _screeningBusy = false;
@@ -1024,6 +1046,7 @@ IMPORTANT:
 
 export function startCronJobs() {
   stopCronJobs(); // stop any running tasks before (re)starting
+  logApiAuthWarningsOnce();
   if (isPaperOnlyMode()) {
     process.env.PAPER_ONLY = "true";
     process.env.DRY_RUN = "true";

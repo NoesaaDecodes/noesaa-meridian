@@ -26,7 +26,7 @@ import { addToBlacklist, removeFromBlacklist, listBlacklist } from "../token-bla
 import { blockDev, unblockDev, listBlockedDevs } from "../dev-blocklist.js";
 import { addSmartWallet, removeSmartWallet, listSmartWallets, checkSmartWalletsOnPool } from "../smart-wallets.js";
 import { getTokenInfo, getTokenHolders, getTokenNarrative } from "./token.js";
-import { config, reloadScreeningThresholds, MIN_SAFE_BINS_BELOW } from "../config.js";
+import { classifyApiError, config, reloadScreeningThresholds, MIN_SAFE_BINS_BELOW } from "../config.js";
 import { getRecentDecisions } from "../decision-log.js";
 import fs from "fs";
 import path from "path";
@@ -126,7 +126,12 @@ async function fetchFreshPoolDetail(poolAddress, timeframe = config.screening.ti
   const filter = encodeURIComponent(`pool_address=${poolAddress}`);
   const url = `${POOL_DISCOVERY_BASE}/pools?page_size=1&filter_by=${filter}&timeframe=${encodedTimeframe}`;
   const res = await fetch(url);
-  if (!res.ok) throw new Error(`Pool Discovery API error: ${res.status} ${res.statusText}`);
+  if (!res.ok) {
+    const error = new Error(`Pool Discovery API error: ${res.status} ${res.statusText}`);
+    error.provider = "Meteora Pool Discovery";
+    error.status = res.status;
+    throw error;
+  }
   const data = await res.json();
   return (data?.data || [])[0] ?? null;
 }
@@ -137,9 +142,15 @@ async function validateDeployPoolThresholds(args) {
     detail = await fetchFreshPoolDetail(args.pool_address);
     if (!detail) throw new Error(`Pool ${args.pool_address} not found`);
   } catch (error) {
+    const classified = classifyApiError(error, error.provider || "Meteora Pool Discovery");
     return {
       pass: false,
-      reason: `Could not verify pool screening thresholds before deploy: ${error.message}`,
+      type: classified.infrastructureFailure ? "infrastructure_auth" : "infrastructure",
+      provider: classified.provider,
+      authFailure: classified.authFailure,
+      reason: classified.infrastructureFailure
+        ? `${classified.operatorMessage} Deploy verification skipped; this is not a candidate rejection.`
+        : `INFRA: Could not verify pool screening thresholds before deploy: ${error.message}`,
     };
   }
 
@@ -149,18 +160,21 @@ async function validateDeployPoolThresholds(args) {
   if (tvl == null) {
     return {
       pass: false,
+      type: "safety_filter",
       reason: "Could not verify pool TVL before deploy.",
     };
   }
   if (minTvl != null && minTvl > 0 && tvl < minTvl) {
     return {
       pass: false,
+      type: "safety_filter",
       reason: `Pool TVL $${tvl} is below configured minTvl $${minTvl}.`,
     };
   }
   if (maxTvl != null && maxTvl > 0 && tvl > maxTvl) {
     return {
       pass: false,
+      type: "safety_filter",
       reason: `Pool TVL $${tvl} is above configured maxTvl $${maxTvl}.`,
     };
   }
@@ -174,7 +188,8 @@ async function validateDeployPoolThresholds(args) {
   ) {
     return {
       pass: false,
-      reason: `Pool fee/active-TVL ${feeActiveTvlRatio ?? "unknown"}% is below configured minFeeActiveTvlRatio ${minFeeActiveTvlRatio}%.`,
+      type: "safety_filter",
+      reason: `SAFETY FILTER: Pool fee/active-TVL ${feeActiveTvlRatio ?? "unknown"}% is below configured minFeeActiveTvlRatio ${minFeeActiveTvlRatio}%.`,
     };
   }
 
@@ -186,6 +201,7 @@ async function validateDeployPoolThresholds(args) {
     } catch (error) {
       return {
         pass: false,
+        type: "safety_filter",
         reason: `Could not verify pool ${volatilityTimeframe} volatility before deploy: ${error.message}`,
       };
     }
@@ -195,6 +211,7 @@ async function validateDeployPoolThresholds(args) {
   if (volatility == null || volatility <= 0) {
     return {
       pass: false,
+      type: "safety_filter",
       reason: `Pool ${volatilityTimeframe} volatility ${volatility ?? "unknown"} is unusable. Refusing deploy.`,
     };
   }
@@ -205,12 +222,14 @@ async function validateDeployPoolThresholds(args) {
   if (actualBinStep != null && minStep != null && actualBinStep < minStep) {
     return {
       pass: false,
+      type: "safety_filter",
       reason: `Pool bin_step ${actualBinStep} is below configured minBinStep ${minStep}.`,
     };
   }
   if (actualBinStep != null && maxStep != null && actualBinStep > maxStep) {
     return {
       pass: false,
+      type: "safety_filter",
       reason: `Pool bin_step ${actualBinStep} is above configured maxBinStep ${maxStep}.`,
     };
   }
@@ -635,6 +654,9 @@ export async function executeTool(name, args) {
       log("safety_block", `${name} blocked: ${safetyCheck.reason}`);
       return {
         blocked: true,
+        type: safetyCheck.type || "safety_filter",
+        provider: safetyCheck.provider || null,
+        authFailure: safetyCheck.authFailure === true,
         reason: safetyCheck.reason,
       };
     }

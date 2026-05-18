@@ -19,7 +19,18 @@ function numericConfig(value) {
   return Number.isFinite(n) ? n : null;
 }
 
+export function getDefaultMinFeeActiveTvlRatio({ paperOnly = false, timeframe = "5m", configuredValue = null } = {}) {
+  if (configuredValue != null) return configuredValue;
+  return paperOnly && timeframe === "5m" ? 0.02 : 0.05;
+}
+
 const legacyBinsBelow = numericConfig(u.binsBelow);
+const configuredScreeningTimeframe = u.timeframe ?? "5m";
+const defaultMinFeeActiveTvlRatio = getDefaultMinFeeActiveTvlRatio({
+  paperOnly: process.env.PAPER_ONLY === "true" || u.paperOnly === true,
+  timeframe: configuredScreeningTimeframe,
+  configuredValue: u.minFeeActiveTvlRatio,
+});
 const configuredMinBinsBelow = numericConfig(u.minBinsBelow) ?? MIN_SAFE_BINS_BELOW;
 const configuredMaxBinsBelow = numericConfig(u.maxBinsBelow)
   ?? (legacyBinsBelow != null ? Math.max(legacyBinsBelow, configuredMinBinsBelow) : 69);
@@ -83,7 +94,7 @@ export const config = {
   // ─── Pool Screening Thresholds ───────────
   screening: {
     excludeHighSupplyConcentration: u.excludeHighSupplyConcentration ?? true,
-    minFeeActiveTvlRatio: u.minFeeActiveTvlRatio ?? 0.05,
+    minFeeActiveTvlRatio: u.minFeeActiveTvlRatio ?? defaultMinFeeActiveTvlRatio,
     minTvl:            u.minTvl            ?? 5_000,
     maxTvl:            u.maxTvl !== undefined ? u.maxTvl : 150_000,
     minVolume:         u.minVolume         ?? 500,
@@ -94,7 +105,7 @@ export const config = {
     maxMcap:           u.maxMcap           ?? 10_000_000,
     minBinStep:        u.minBinStep        ?? 80,
     maxBinStep:        u.maxBinStep        ?? 125,
-    timeframe:         u.timeframe         ?? "5m",
+    timeframe:         configuredScreeningTimeframe,
     category:          u.category          ?? "trending",
     minTokenFeesSol:   u.minTokenFeesSol   ?? 30,  // global fees paid (priority+jito tips). below = bundled/scam
     useDiscordSignals: u.useDiscordSignals ?? false,
@@ -256,6 +267,66 @@ export function computeDeployAmount(walletSol) {
   const dynamic    = deployable * pct;
   const result     = Math.min(ceil, Math.max(floor, dynamic));
   return parseFloat(result.toFixed(2));
+}
+
+function hasInvalidPlaceholder(value) {
+  const text = String(value || "").trim();
+  return !text || /^(changeme|replace_me|your_|invalid|test)$/i.test(text) || text.length < 12;
+}
+
+export function classifyApiError(error, provider = "API") {
+  const message = String(error?.message || error?.error || error || "");
+  const status = Number(error?.status ?? error?.statusCode ?? (message.match(/\b(401|403)\b/)?.[1]));
+  const authFailure = status === 401 || status === 403 || /\b(unauthorized|forbidden|invalid api key|api key|auth(?:orization)? failed)\b/i.test(message);
+  return {
+    provider,
+    status: Number.isFinite(status) ? status : null,
+    authFailure,
+    infrastructureFailure: authFailure || /\b(timeout|network|fetch failed|econn|enotfound|rate limit|429|5\d\d)\b/i.test(message),
+    message,
+    operatorMessage: authFailure
+      ? `INFRA/AUTH: ${provider} rejected API credentials${Number.isFinite(status) ? ` (${status})` : ""}.`
+      : `INFRA: ${provider} request failed${Number.isFinite(status) ? ` (${status})` : ""}.`,
+  };
+}
+
+export function getApiAuthWarnings() {
+  const warnings = [];
+  const agentMeridianKey = config.api?.publicApiKey || "";
+  if (hasInvalidPlaceholder(agentMeridianKey)) {
+    warnings.push({
+      provider: "Agent Meridian",
+      reason: "PUBLIC_API_KEY / publicApiKey is missing or invalid-looking.",
+      required: true,
+    });
+  }
+  if (!process.env.LLM_API_KEY && !process.env.OPENROUTER_API_KEY) {
+    warnings.push({
+      provider: "LLM provider",
+      reason: "LLM_API_KEY / OPENROUTER_API_KEY is missing.",
+      required: true,
+    });
+  }
+  if (config.api?.lpAgentRelayEnabled && hasInvalidPlaceholder(process.env.LPAGENT_API_KEY)) {
+    warnings.push({
+      provider: "LPAgent",
+      reason: "LPAGENT_API_KEY is required when lpAgentRelayEnabled=true.",
+      required: true,
+    });
+  }
+  const okxParts = [
+    process.env.OKX_API_KEY || process.env.OK_ACCESS_KEY,
+    process.env.OKX_SECRET_KEY || process.env.OK_ACCESS_SECRET,
+    process.env.OKX_PASSPHRASE || process.env.OK_ACCESS_PASSPHRASE,
+  ].filter(Boolean);
+  if (okxParts.length > 0 && okxParts.length < 3) {
+    warnings.push({
+      provider: "OKX",
+      reason: "Partial OKX credentials configured; either set key/secret/passphrase or leave all unset for public fallback.",
+      required: false,
+    });
+  }
+  return warnings;
 }
 
 /**
