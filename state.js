@@ -480,8 +480,15 @@ export function trackPaperPosition({
   smart_wallet_score = null,
   narrative_strength = null,
   entry_volume = null,
+  paper_options = {},
 }) {
   const state = load();
+  ensurePaperAccount(state, paper_options);
+  const deployCheck = canOpenPaperPosition({ pool, amount_sol }, paper_options);
+  if (!deployCheck.ok) {
+    log("paper_warn", `Paper deploy rejected for ${pool_name || pool}: ${deployCheck.reason}`);
+    return { ok: false, reason: deployCheck.reason };
+  }
   const paperEntrySignals = {
     ...(signal_snapshot || {}),
     volume: entry_volume ?? signal_snapshot?.volume ?? null,
@@ -533,9 +540,11 @@ export function trackPaperPosition({
     paper_failed_refresh_count: 0,
     last_paper_volume: entry_volume ?? signal_snapshot?.volume ?? null,
   };
+  debitPaperDeploy(state, Number(amount_sol));
   pushEvent(state, { action: "paper_deploy", position, pool_name: pool_name || pool });
   save(state);
-  log("state", `Paper position tracked: ${position} in pool ${pool}`);
+  log("paper", `Paper position tracked: ${position} in pool ${pool} | debit ${Number(amount_sol).toFixed(4)} SOL | available ${state.paperAccount.available_balance_sol.toFixed(4)} SOL`);
+  return { ok: true, position: state.positions[position], account: state.paperAccount };
 }
 
 export function getPaperPositions(openOnly = true) {
@@ -544,10 +553,175 @@ export function getPaperPositions(openOnly = true) {
   return openOnly ? all.filter((p) => !p.closed) : all;
 }
 
-export function getPaperLifecycleHistory(limit = 50) {
+export function getPaperLifecycleHistory(limit = null) {
   const state = load();
   const history = state.paperLifecycleHistory || [];
-  return history.slice(-limit);
+  return Number.isFinite(limit) ? history.slice(-Math.max(0, limit)) : history;
+}
+
+function ensurePaperAccount(state, options = {}) {
+  if (!state.paperAccount) {
+    const startingBalanceSol = round(options.startingBalanceSol ?? 5, 9) ?? 5;
+    state.paperAccount = {
+      starting_balance_sol: startingBalanceSol,
+      available_balance_sol: startingBalanceSol,
+      deployed_balance_sol: 0,
+      realized_pnl_sol: 0,
+      total_deployed_sol: 0,
+      total_closed_sol: 0,
+      initialized_at: new Date().toISOString(),
+      last_updated_at: null,
+    };
+  }
+  return state.paperAccount;
+}
+
+function getOpenPaperPositionsFromState(state) {
+  return Object.values(state.positions || {}).filter((p) => p.paper && !p.closed);
+}
+
+function findRecentPaperCloseForPool(state, pool, cooldownMinutes) {
+  if (!pool || !Number.isFinite(cooldownMinutes) || cooldownMinutes <= 0) return null;
+  const cutoff = Date.now() - cooldownMinutes * 60_000;
+  const closed = Object.values(state.positions || {})
+    .filter((p) => p.paper && p.closed && p.pool === pool && p.closed_at)
+    .sort((a, b) => new Date(b.closed_at).getTime() - new Date(a.closed_at).getTime());
+  const recent = closed.find((p) => new Date(p.closed_at).getTime() >= cutoff);
+  return recent || null;
+}
+
+export function initPaperAccount(options = {}) {
+  const state = load();
+  const account = ensurePaperAccount(state, options);
+  account.last_updated_at = new Date().toISOString();
+  save(state);
+  return account;
+}
+
+export function getPaperAccount(options = {}) {
+  const state = load();
+  const account = ensurePaperAccount(state, options);
+  return { ...account };
+}
+
+export function computePaperDeployAmount(options = {}) {
+  const account = getPaperAccount({ startingBalanceSol: options.startingBalanceSol });
+  const available = account.available_balance_sol ?? 0;
+  const reserve = options.gasReserveSol ?? 0;
+  const pct = options.positionSizePct ?? 0.35;
+  const floor = options.minDeploySol ?? 0.5;
+  const ceil = options.maxDeploySol ?? 50;
+  const deployable = Math.max(0, available - reserve);
+  if (deployable < floor) return 0;
+  const dynamic = deployable * pct;
+  return round(Math.min(ceil, Math.max(floor, dynamic)), 2);
+}
+
+export function canOpenPaperPosition({ pool, amount_sol }, options = {}) {
+  const state = load();
+  const account = ensurePaperAccount(state, options);
+  const open = getOpenPaperPositionsFromState(state);
+  const maxOpen = options.maxOpenPositions ?? 3;
+  const amount = Number(amount_sol);
+
+  if (open.length >= maxOpen) {
+    return { ok: false, reason: `Paper max open positions reached (${open.length}/${maxOpen})` };
+  }
+  if (pool && open.some((p) => p.pool === pool)) {
+    return { ok: false, reason: `Paper duplicate pool blocked: ${pool}` };
+  }
+  const recentClose = findRecentPaperCloseForPool(state, pool, options.cooldownMinutesAfterClose ?? 0);
+  if (recentClose) {
+    return { ok: false, reason: `Paper pool cooldown active after close at ${recentClose.closed_at}` };
+  }
+  if (!Number.isFinite(amount) || amount <= 0) {
+    return { ok: false, reason: "Paper deploy amount must be positive" };
+  }
+  if ((account.available_balance_sol ?? 0) < amount) {
+    return { ok: false, reason: `Paper balance too low: have ${account.available_balance_sol} SOL, need ${amount} SOL` };
+  }
+  return { ok: true };
+}
+
+function debitPaperDeploy(state, amountSol) {
+  const account = ensurePaperAccount(state);
+  account.available_balance_sol = round((account.available_balance_sol || 0) - amountSol, 9);
+  account.deployed_balance_sol = round((account.deployed_balance_sol || 0) + amountSol, 9);
+  account.total_deployed_sol = round((account.total_deployed_sol || 0) + amountSol, 9);
+  account.last_updated_at = new Date().toISOString();
+}
+
+function creditPaperClose(state, amountSol, pnlSol) {
+  const account = ensurePaperAccount(state);
+  const returnedSol = (Number.isFinite(amountSol) ? amountSol : 0) + (Number.isFinite(pnlSol) ? pnlSol : 0);
+  account.available_balance_sol = round((account.available_balance_sol || 0) + returnedSol, 9);
+  account.deployed_balance_sol = round(Math.max(0, (account.deployed_balance_sol || 0) - (Number.isFinite(amountSol) ? amountSol : 0)), 9);
+  account.realized_pnl_sol = round((account.realized_pnl_sol || 0) + (Number.isFinite(pnlSol) ? pnlSol : 0), 9);
+  account.total_closed_sol = round((account.total_closed_sol || 0) + (Number.isFinite(amountSol) ? amountSol : 0), 9);
+  account.last_updated_at = new Date().toISOString();
+}
+
+function average(values) {
+  const nums = values.filter(isFiniteNumber);
+  if (!nums.length) return null;
+  return round(nums.reduce((sum, value) => sum + value, 0) / nums.length, 2);
+}
+
+function reasonCounts(history) {
+  const counts = new Map();
+  for (const record of history) {
+    const reason = record.close_reason || "unknown";
+    counts.set(reason, (counts.get(reason) || 0) + 1);
+  }
+  return [...counts.entries()]
+    .map(([reason, count]) => ({ reason, count }))
+    .sort((a, b) => b.count - a.count || a.reason.localeCompare(b.reason));
+}
+
+function summarizeSmartWalletGroup(records) {
+  if (!records.length) return null;
+  const wins = records.filter((r) => isFiniteNumber(r.realized_pnl_pct) && r.realized_pnl_pct > 0).length;
+  return {
+    count: records.length,
+    win_rate_pct: round((wins / records.length) * 100, 2),
+    avg_realized_pnl_pct: average(records.map((r) => r.realized_pnl_pct)),
+  };
+}
+
+export function getPaperLifecycleReport(limitRecent = 10) {
+  const history = getPaperLifecycleHistory();
+  const withPnl = history.filter((r) => isFiniteNumber(r.realized_pnl_pct));
+  const wins = withPnl.filter((r) => r.realized_pnl_pct > 0).length;
+  const bestTrade = withPnl.length
+    ? withPnl.reduce((best, r) => (r.realized_pnl_pct > best.realized_pnl_pct ? r : best), withPnl[0])
+    : null;
+  const worstTrade = withPnl.length
+    ? withPnl.reduce((worst, r) => (r.realized_pnl_pct < worst.realized_pnl_pct ? r : worst), withPnl[0])
+    : null;
+
+  const smartKnown = history.filter((r) => typeof r.smart_wallets_present_at_entry === "boolean");
+  const smartWalletComparison = smartKnown.length
+    ? {
+        present: summarizeSmartWalletGroup(smartKnown.filter((r) => r.smart_wallets_present_at_entry)),
+        absent: summarizeSmartWalletGroup(smartKnown.filter((r) => !r.smart_wallets_present_at_entry)),
+      }
+    : null;
+
+  return {
+    total_closed: history.length,
+    win_rate_pct: withPnl.length ? round((wins / withPnl.length) * 100, 2) : null,
+    avg_realized_pnl_pct: average(history.map((r) => r.realized_pnl_pct)),
+    avg_hold_duration_minutes: average(history.map((r) => r.hold_duration_minutes)),
+    best_trade: bestTrade,
+    worst_trade: worstTrade,
+    avg_max_unrealized_pnl_pct: average(history.map((r) => r.max_unrealized_pnl_pct)),
+    avg_giveback_from_peak_pct: average(history.map((r) => r.exit_quality?.gave_back_from_peak_pct)),
+    close_reasons: reasonCounts(history),
+    avg_range_efficiency_pct: average(history.map((r) => r.hold_quality?.range_efficiency_pct)),
+    avg_volume_decay_pct: average(history.map((r) => r.volume_decay_pct)),
+    smart_wallet_comparison: smartWalletComparison,
+    recent: history.slice(-Math.max(0, limitRecent)).reverse(),
+  };
 }
 
 export function closePaperPosition(position_address, reason, pnl_pct, pnl_sol) {
@@ -573,10 +747,11 @@ export function closePaperPosition(position_address, reason, pnl_pct, pnl_sol) {
   const lifecycle = buildPaperLifecycleRecord(pos);
   pos.paper_lifecycle = lifecycle;
   appendPaperLifecycle(state, lifecycle);
+  creditPaperClose(state, pos.amount_sol, pos.paper_pnl_sol);
   pos.notes.push(`Paper closed: ${reason} | PnL: ${formatPct(finalPnlPct)} (${pos.paper_pnl_sol?.toFixed(6) ?? "?"} SOL)`);
   pushEvent(state, { action: "paper_close", position: position_address, pnl_pct: finalPnlPct, pnl_sol: pos.paper_pnl_sol, reason });
   save(state);
-  log("state", `Paper position closed: ${position_address} - ${reason} - PnL ${formatPct(finalPnlPct)} | hold ${lifecycle.hold_duration_minutes ?? "?"}m | max ${formatPct(lifecycle.max_unrealized_pnl_pct)} | min ${formatPct(lifecycle.min_unrealized_pnl_pct)}`);
+  log("paper", `Paper position closed: ${position_address} - ${reason} - PnL ${formatPct(finalPnlPct)} | hold ${lifecycle.hold_duration_minutes ?? "?"}m | max ${formatPct(lifecycle.max_unrealized_pnl_pct)} | min ${formatPct(lifecycle.min_unrealized_pnl_pct)} | available ${state.paperAccount.available_balance_sol.toFixed(4)} SOL`);
   return pos;
 }
 

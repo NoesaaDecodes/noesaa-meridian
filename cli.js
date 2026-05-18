@@ -12,6 +12,10 @@ import path from "path";
 
 // ─── DRY_RUN must be set before any tool imports ─────────────────
 if (process.argv.includes("--dry-run")) process.env.DRY_RUN = "true";
+if (process.argv.includes("paper-start")) {
+  process.env.PAPER_ONLY = "true";
+  process.env.DRY_RUN = "true";
+}
 
 // ─── Load .env from ~/.meridian/ if present ──────────────────────
 const meridianDir = path.join(os.homedir(), ".meridian");
@@ -32,6 +36,93 @@ function out(data) {
 function die(msg, extra = {}) {
   process.stderr.write(JSON.stringify({ error: msg, ...extra }) + "\n");
   process.exit(1);
+}
+
+function fmtPct(value) {
+  return Number.isFinite(value) ? `${value.toFixed(2)}%` : "n/a";
+}
+
+function fmtNum(value, digits = 2) {
+  return Number.isFinite(value) ? value.toFixed(digits) : "n/a";
+}
+
+function fmtMinutes(value) {
+  if (!Number.isFinite(value)) return "n/a";
+  if (value < 60) return `${Math.round(value)}m`;
+  const hours = value / 60;
+  return `${hours.toFixed(1)}h`;
+}
+
+function truncate(text, width) {
+  const s = String(text ?? "");
+  return s.length > width ? `${s.slice(0, Math.max(0, width - 1))}...` : s;
+}
+
+function pad(text, width) {
+  return truncate(text, width).padEnd(width);
+}
+
+function formatTrade(record) {
+  if (!record) return "n/a";
+  return `${record.pool_name || record.pool || record.position} | ${fmtPct(record.realized_pnl_pct)} | ${record.close_reason || "unknown"}`;
+}
+
+function formatPaperReport(report) {
+  const lines = [];
+  lines.push("Paper Trading Lifecycle Report");
+  lines.push("================================");
+  lines.push("");
+  lines.push(`Closed paper positions: ${report.total_closed}`);
+
+  if (!report.total_closed) {
+    lines.push("No closed paper lifecycle records found in state.json.");
+    return lines.join("\n");
+  }
+
+  lines.push(`Win rate: ${fmtPct(report.win_rate_pct)}`);
+  lines.push(`Average realized PnL: ${fmtPct(report.avg_realized_pnl_pct)}`);
+  lines.push(`Average hold duration: ${fmtMinutes(report.avg_hold_duration_minutes)}`);
+  lines.push(`Best trade: ${formatTrade(report.best_trade)}`);
+  lines.push(`Worst trade: ${formatTrade(report.worst_trade)}`);
+  lines.push(`Average max unrealized PnL: ${fmtPct(report.avg_max_unrealized_pnl_pct)}`);
+  lines.push(`Average giveback from peak: ${fmtPct(report.avg_giveback_from_peak_pct)}`);
+  lines.push(`Average range efficiency: ${fmtPct(report.avg_range_efficiency_pct)}`);
+  lines.push(`Average volume decay: ${fmtPct(report.avg_volume_decay_pct)}`);
+  lines.push("");
+
+  lines.push("Most Common Close Reasons");
+  for (const item of report.close_reasons.slice(0, 5)) {
+    lines.push(`- ${item.reason}: ${item.count}`);
+  }
+
+  if (report.smart_wallet_comparison) {
+    lines.push("");
+    lines.push("Smart Wallet Entry Comparison");
+    const present = report.smart_wallet_comparison.present;
+    const absent = report.smart_wallet_comparison.absent;
+    lines.push(`- Present: ${present ? `${present.count} trades | WR ${fmtPct(present.win_rate_pct)} | Avg ${fmtPct(present.avg_realized_pnl_pct)}` : "no data"}`);
+    lines.push(`- Absent: ${absent ? `${absent.count} trades | WR ${fmtPct(absent.win_rate_pct)} | Avg ${fmtPct(absent.avg_realized_pnl_pct)}` : "no data"}`);
+  }
+
+  lines.push("");
+  lines.push("Last 10 Closed Paper Positions");
+  lines.push(`${pad("Closed", 16)} ${pad("Pool", 18)} ${pad("PnL", 9)} ${pad("Max", 9)} ${pad("Giveback", 10)} ${pad("Hold", 7)} ${pad("Range", 8)} Reason`);
+  lines.push(`${"-".repeat(16)} ${"-".repeat(18)} ${"-".repeat(9)} ${"-".repeat(9)} ${"-".repeat(10)} ${"-".repeat(7)} ${"-".repeat(8)} ${"-".repeat(24)}`);
+  for (const record of report.recent) {
+    const closed = record.close_timestamp ? record.close_timestamp.slice(0, 16).replace("T", " ") : "n/a";
+    lines.push([
+      pad(closed, 16),
+      pad(record.pool_name || record.pool || "unknown", 18),
+      pad(fmtPct(record.realized_pnl_pct), 9),
+      pad(fmtPct(record.max_unrealized_pnl_pct), 9),
+      pad(fmtPct(record.exit_quality?.gave_back_from_peak_pct), 10),
+      pad(fmtMinutes(record.hold_duration_minutes), 7),
+      pad(fmtPct(record.hold_quality?.range_efficiency_pct), 8),
+      truncate(record.close_reason || "unknown", 48),
+    ].join(" "));
+  }
+
+  return lines.join("\n");
 }
 
 // ─── SKILL.md generation ──────────────────────────────────────────
@@ -199,6 +290,12 @@ Shows all closed position performance history with summary stats.
 \`\`\`
 Output: { summary: { total_positions_closed, total_pnl_usd, avg_pnl_pct, win_rate_pct, total_lessons }, count, positions: [...] }
 \`\`\`
+
+### meridian paper-report
+Prints a readable paper trading lifecycle performance report from state.json.
+
+### meridian paper-start
+Starts continuous paper-only simulation mode. Forces DRY_RUN and never sends on-chain transactions.
 
 ### meridian discord-signals [clear]
 Shows pending Discord signal queue from the discord-listener process.
@@ -533,6 +630,17 @@ switch (subcommand) {
     break;
   }
 
+  case "paper-start": {
+    process.env.PAPER_ONLY = "true";
+    process.env.DRY_RUN = "true";
+    const { startCronJobs } = await import("./index.js");
+    const { getPaperAccount } = await import("./state.js");
+    const account = getPaperAccount();
+    process.stderr.write(`[meridian] PAPER MODE starting - no on-chain transactions. Virtual balance: ${account.available_balance_sol} SOL\n`);
+    startCronJobs();
+    break;
+  }
+
   // ── lessons ──────────────────────────────────────────────────────
   case "lessons": {
     if (sub2 === "add") {
@@ -599,6 +707,12 @@ switch (subcommand) {
     const history = getPerformanceHistory({ hours: 999999, limit });
     const summary = getPerformanceSummary();
     out({ summary, ...history });
+    break;
+  }
+
+  case "paper-report": {
+    const { getPaperLifecycleReport } = await import("./state.js");
+    process.stdout.write(formatPaperReport(getPaperLifecycleReport(10)) + "\n");
     break;
   }
 

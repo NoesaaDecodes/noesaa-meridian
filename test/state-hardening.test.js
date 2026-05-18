@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
 import fs from "fs";
 import os from "os";
 import path from "path";
@@ -204,4 +205,160 @@ test("failed paper refresh cycles do not mutate lifecycle quality metrics", () =
   assert.equal(lifecycle.max_unrealized_pnl_pct, 8);
   assert.equal(lifecycle.min_unrealized_pnl_pct, 6);
   assert.equal(lifecycle.hold_quality.failed_refresh_count, 1);
+});
+
+test("paper lifecycle report summarizes closed paper history", () => {
+  resetState();
+  const history = [
+    {
+      position: "p1",
+      pool_name: "AAA/SOL",
+      close_timestamp: "2026-05-18T00:00:00.000Z",
+      hold_duration_minutes: 30,
+      realized_pnl_pct: 10,
+      max_unrealized_pnl_pct: 14,
+      close_reason: "take profit",
+      volume_decay_pct: 20,
+      smart_wallets_present_at_entry: true,
+      hold_quality: { range_efficiency_pct: 90 },
+      exit_quality: { gave_back_from_peak_pct: 4 },
+    },
+    {
+      position: "p2",
+      pool_name: "BBB/SOL",
+      close_timestamp: "2026-05-18T01:00:00.000Z",
+      hold_duration_minutes: 90,
+      realized_pnl_pct: -5,
+      max_unrealized_pnl_pct: 2,
+      close_reason: "stop loss",
+      volume_decay_pct: 60,
+      smart_wallets_present_at_entry: false,
+      hold_quality: { range_efficiency_pct: 50 },
+      exit_quality: { gave_back_from_peak_pct: 7 },
+    },
+  ];
+  fs.writeFileSync(stateFile, JSON.stringify({ positions: {}, recentEvents: [], paperLifecycleHistory: history }, null, 2));
+
+  const report = state.getPaperLifecycleReport(10);
+  assert.equal(report.total_closed, 2);
+  assert.equal(report.win_rate_pct, 50);
+  assert.equal(report.avg_realized_pnl_pct, 2.5);
+  assert.equal(report.avg_hold_duration_minutes, 60);
+  assert.equal(report.best_trade.position, "p1");
+  assert.equal(report.worst_trade.position, "p2");
+  assert.equal(report.avg_max_unrealized_pnl_pct, 8);
+  assert.equal(report.avg_giveback_from_peak_pct, 5.5);
+  assert.equal(report.avg_range_efficiency_pct, 70);
+  assert.equal(report.avg_volume_decay_pct, 40);
+  assert.equal(report.smart_wallet_comparison.present.avg_realized_pnl_pct, 10);
+  assert.equal(report.smart_wallet_comparison.absent.avg_realized_pnl_pct, -5);
+});
+
+test("cli paper-report prints readable lifecycle summary", () => {
+  resetState();
+  fs.writeFileSync(stateFile, JSON.stringify({
+    positions: {},
+    recentEvents: [],
+    paperLifecycleHistory: [{
+      position: "p1",
+      pool_name: "AAA/SOL",
+      close_timestamp: "2026-05-18T00:00:00.000Z",
+      hold_duration_minutes: 30,
+      realized_pnl_pct: 10,
+      max_unrealized_pnl_pct: 14,
+      close_reason: "take profit",
+      volume_decay_pct: 20,
+      smart_wallets_present_at_entry: true,
+      hold_quality: { range_efficiency_pct: 90 },
+      exit_quality: { gave_back_from_peak_pct: 4 },
+    }],
+  }, null, 2));
+
+  const result = spawnSync(process.execPath, ["cli.js", "paper-report"], {
+    cwd: process.cwd(),
+    env: {
+      ...process.env,
+      MERIDIAN_STATE_FILE: stateFile,
+      USERPROFILE: tempDir,
+      HOME: tempDir,
+      APPDATA: tempDir,
+    },
+    encoding: "utf8",
+  });
+
+  assert.equal(result.status, 0, result.stderr);
+  assert.match(result.stdout, /Paper Trading Lifecycle Report/);
+  assert.match(result.stdout, /Closed paper positions: 1/);
+  assert.match(result.stdout, /Win rate: 100\.00%/);
+  assert.match(result.stdout, /AAA\/SOL/);
+  assert.match(result.stdout, /take profit/);
+});
+
+test("paper account debits deploys, blocks duplicates, and credits closes", () => {
+  resetState();
+  const account = state.initPaperAccount({ startingBalanceSol: 2 });
+  assert.equal(account.available_balance_sol, 2);
+
+  const first = state.trackPaperPosition({
+    position: "paper_balance_1",
+    pool: "pool_balance",
+    pool_name: "BAL/SOL",
+    strategy: "test",
+    bin_range: { min: 1, max: 2 },
+    amount_sol: 0.5,
+    active_bin: 1,
+    entry_price_sol: 1,
+    paper_options: { startingBalanceSol: 2, maxOpenPositions: 2, cooldownMinutesAfterClose: 60 },
+  });
+  assert.equal(first.ok, true);
+  assert.equal(state.getPaperAccount().available_balance_sol, 1.5);
+  assert.equal(state.getPaperAccount().deployed_balance_sol, 0.5);
+
+  const duplicate = state.canOpenPaperPosition(
+    { pool: "pool_balance", amount_sol: 0.5 },
+    { maxOpenPositions: 2, cooldownMinutesAfterClose: 60 },
+  );
+  assert.equal(duplicate.ok, false);
+  assert.match(duplicate.reason, /duplicate pool/i);
+
+  state.closePaperPosition("paper_balance_1", "take profit", 10, 0.05);
+  assert.equal(state.getPaperAccount().available_balance_sol, 2.05);
+  assert.equal(state.getPaperAccount().deployed_balance_sol, 0);
+  assert.equal(state.getPaperAccount().realized_pnl_sol, 0.05);
+
+  const cooldown = state.canOpenPaperPosition(
+    { pool: "pool_balance", amount_sol: 0.5 },
+    { maxOpenPositions: 2, cooldownMinutesAfterClose: 60 },
+  );
+  assert.equal(cooldown.ok, false);
+  assert.match(cooldown.reason, /cooldown/i);
+});
+
+test("paper deploy sizing uses virtual balance and clamps deterministically", () => {
+  resetState();
+  state.initPaperAccount({ startingBalanceSol: 10 });
+  assert.equal(state.computePaperDeployAmount({
+    positionSizePct: 0.25,
+    minDeploySol: 0.5,
+    maxDeploySol: 2,
+    gasReserveSol: 0,
+  }), 2);
+
+  state.trackPaperPosition({
+    position: "paper_size_1",
+    pool: "pool_size",
+    pool_name: "SIZE/SOL",
+    strategy: "test",
+    bin_range: { min: 1, max: 2 },
+    amount_sol: 9.7,
+    active_bin: 1,
+    entry_price_sol: 1,
+    paper_options: { maxOpenPositions: 2 },
+  });
+  assert.equal(state.computePaperDeployAmount({
+    positionSizePct: 0.5,
+    minDeploySol: 0.5,
+    maxDeploySol: 2,
+    gasReserveSol: 0,
+  }), 0);
 });

@@ -15,9 +15,10 @@
     "pm2:restart": "pm2 restart meridian --update-env",
     "pm2:logs": "pm2 logs meridian --lines 100",
     "dev": "DRY_RUN=true node index.js",
-    "test": "npm run test:syntax && npm run test:state",
+    "test": "npm run test:syntax && npm run test:state && npm run test:telegram",
     "test:syntax": "node scripts/check-syntax.js",
     "test:state": "node --test test/state-hardening.test.js",
+    "test:telegram": "node --test test/telegram-digest.test.js",
     "test:screen": "node test/test-screening.js",
     "test:agent": "DRY_RUN=true node test/test-agent.js",
     "postinstall": "node scripts/patch-anchor.js"
