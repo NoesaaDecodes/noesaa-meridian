@@ -17,7 +17,11 @@ function load() {
 }
 
 function save(data) {
-  fs.writeFileSync(DECISION_LOG_FILE, JSON.stringify(data, null, 2));
+  try {
+    fs.writeFileSync(DECISION_LOG_FILE, JSON.stringify(data, null, 2));
+  } catch (error) {
+    log("decision_log_warn", `Failed to write ${DECISION_LOG_FILE}: ${error.message}`);
+  }
 }
 
 function sanitize(value, maxLen = 280) {

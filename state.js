@@ -16,6 +16,14 @@ const STATE_FILE = "./state.json";
 const MAX_RECENT_EVENTS = 20;
 const MAX_INSTRUCTION_LENGTH = 280;
 
+function isFiniteNumber(value) {
+  return typeof value === "number" && Number.isFinite(value);
+}
+
+function formatPct(value) {
+  return isFiniteNumber(value) ? `${value.toFixed(2)}%` : "unavailable";
+}
+
 function sanitizeStoredText(text, maxLen = MAX_INSTRUCTION_LENGTH) {
   if (text == null) return null;
   const cleaned = String(text)
@@ -204,7 +212,7 @@ export function setPositionInstruction(position_address, instruction) {
 }
 
 export function queuePeakConfirmation(position_address, candidatePnlPct, options = {}) {
-  if (candidatePnlPct == null) return false;
+  if (!isFiniteNumber(candidatePnlPct)) return false;
   const state = load();
   const pos = state.positions[position_address];
   if (!pos || pos.closed) return false;
@@ -230,7 +238,7 @@ export function queuePeakConfirmation(position_address, candidatePnlPct, options
   pos.pending_peak_pnl_pct = candidatePnlPct;
   pos.pending_peak_started_at = new Date().toISOString();
   save(state);
-  log("state", `Position ${position_address} peak candidate ${candidatePnlPct.toFixed(2)}% queued for 15s confirmation`);
+  log("state", `Position ${position_address} peak candidate ${candidatePnlPct.toFixed(2)}% queued for 15s confirmation (current confirmed peak: ${currentPeak.toFixed(2)}%)`);
   return true;
 }
 
@@ -240,23 +248,30 @@ export function resolvePendingPeak(position_address, currentPnlPct, toleranceRat
   if (!pos || pos.closed || pos.pending_peak_pnl_pct == null) return { confirmed: false, pending: false };
 
   const pendingPeak = pos.pending_peak_pnl_pct;
+
+  if (!isFiniteNumber(currentPnlPct)) {
+    log("state_warn", `Position ${position_address} peak confirmation deferred: current PnL unavailable; pending peak remains ${pendingPeak.toFixed(2)}%`);
+    return { confirmed: false, deferred: true, pending: true, pendingPeak };
+  }
+
   pos.pending_peak_pnl_pct = null;
   pos.pending_peak_started_at = null;
 
-  if (currentPnlPct != null && currentPnlPct >= pendingPeak * toleranceRatio) {
+  const minConfirmPnl = pendingPeak * toleranceRatio;
+  if (currentPnlPct >= minConfirmPnl) {
     pos.peak_pnl_pct = Math.max(pos.peak_pnl_pct ?? 0, pendingPeak, currentPnlPct);
     save(state);
-    log("state", `Position ${position_address} peak PnL confirmed at ${pos.peak_pnl_pct.toFixed(2)}% after recheck`);
+    log("state", `Position ${position_address} peak PnL confirmed at ${pos.peak_pnl_pct.toFixed(2)}% after recheck (pending ${pendingPeak.toFixed(2)}%, current ${currentPnlPct.toFixed(2)}%, min ${minConfirmPnl.toFixed(2)}%)`);
     return { confirmed: true, peak: pos.peak_pnl_pct };
   }
 
   save(state);
-  log("state", `Position ${position_address} rejected pending peak ${pendingPeak.toFixed(2)}% after 15s recheck (current: ${currentPnlPct ?? "?"}%)`);
+  log("state", `Position ${position_address} rejected pending peak ${pendingPeak.toFixed(2)}% after 15s recheck (current: ${formatPct(currentPnlPct)}, min confirmation: ${minConfirmPnl.toFixed(2)}%)`);
   return { confirmed: false, rejected: true, pendingPeak };
 }
 
 export function queueTrailingDropConfirmation(position_address, peakPnlPct, currentPnlPct, trailingDropPct) {
-  if (peakPnlPct == null || currentPnlPct == null || trailingDropPct == null) return false;
+  if (!isFiniteNumber(peakPnlPct) || !isFiniteNumber(currentPnlPct) || !isFiniteNumber(trailingDropPct)) return false;
   const dropFromPeak = peakPnlPct - currentPnlPct;
   if (dropFromPeak < trailingDropPct) return false;
 
@@ -291,13 +306,18 @@ export function resolvePendingTrailingDrop(position_address, currentPnlPct, trai
   const pendingPeak = pos.pending_trailing_peak_pnl_pct;
   const pendingDrop = pos.pending_trailing_drop_pct ?? (pendingPeak - pendingCurrent);
 
+  if (!isFiniteNumber(currentPnlPct)) {
+    log("state_warn", `Position ${position_address} trailing drop confirmation deferred: current PnL unavailable; pending current ${pendingCurrent.toFixed(2)}%, pending peak ${pendingPeak.toFixed(2)}%`);
+    return { confirmed: false, deferred: true, pending: true };
+  }
+
   pos.pending_trailing_current_pnl_pct = null;
   pos.pending_trailing_peak_pnl_pct = null;
   pos.pending_trailing_drop_pct = null;
   pos.pending_trailing_started_at = null;
 
-  const stillNearCrash = currentPnlPct != null && currentPnlPct <= pendingCurrent + tolerancePct;
-  const stillDroppedEnough = currentPnlPct != null && (pendingPeak - currentPnlPct) >= trailingDropPct;
+  const stillNearCrash = currentPnlPct <= pendingCurrent + tolerancePct;
+  const stillDroppedEnough = (pendingPeak - currentPnlPct) >= trailingDropPct;
 
   if (stillNearCrash && stillDroppedEnough) {
     const reason = `Trailing TP: peak ${pendingPeak.toFixed(2)}% → current ${currentPnlPct.toFixed(2)}% (dropped ${(pendingPeak - currentPnlPct).toFixed(2)}% >= ${trailingDropPct}%)`;
@@ -309,7 +329,7 @@ export function resolvePendingTrailingDrop(position_address, currentPnlPct, trai
   }
 
   save(state);
-  log("state", `Position ${position_address} rejected trailing drop after 15s recheck (pending current: ${pendingCurrent.toFixed(2)}%, current: ${currentPnlPct ?? "?"}%)`);
+  log("state", `Position ${position_address} rejected trailing drop after 15s recheck (pending current: ${pendingCurrent.toFixed(2)}%, current: ${formatPct(currentPnlPct)})`);
   return { confirmed: false, rejected: true };
 }
 
@@ -404,6 +424,34 @@ export function closePaperPosition(position_address, reason, pnl_pct, pnl_sol) {
   pushEvent(state, { action: "paper_close", position: position_address, pnl_pct, pnl_sol, reason });
   save(state);
   log("state", `Paper position closed: ${position_address} — ${reason} — PnL ${pnl_pct?.toFixed(2)}%`);
+  return pos;
+}
+
+export function updatePaperPositionPnl(position_address, {
+  pnl_pct,
+  current_price_sol,
+  active_bin,
+  in_range,
+  refresh_error = null,
+} = {}) {
+  const state = load();
+  const pos = state.positions[position_address];
+  if (!pos || !pos.paper || pos.closed) return null;
+
+  const now = new Date().toISOString();
+  if (isFiniteNumber(pnl_pct)) {
+    pos.last_paper_pnl_pct = pnl_pct;
+    pos.last_paper_price_sol = isFiniteNumber(current_price_sol) ? current_price_sol : pos.last_paper_price_sol ?? null;
+    pos.last_paper_active_bin = active_bin ?? pos.last_paper_active_bin ?? null;
+    pos.last_paper_in_range = typeof in_range === "boolean" ? in_range : pos.last_paper_in_range ?? true;
+    pos.last_paper_pnl_at = now;
+    pos.last_paper_pnl_error = null;
+  } else if (refresh_error) {
+    pos.last_paper_pnl_error = sanitizeStoredText(refresh_error, 180);
+    pos.last_paper_pnl_error_at = now;
+  }
+
+  save(state);
   return pos;
 }
 
@@ -507,7 +555,7 @@ export function updatePnlAndCheckExits(position_address, positionData, mgmtConfi
   if (changed) save(state);
 
   // ── Stop loss ──────────────────────────────────────────────────
-  if (!pnl_pct_suspicious && currentPnlPct != null && mgmtConfig.stopLossPct != null && currentPnlPct <= mgmtConfig.stopLossPct) {
+  if (!pnl_pct_suspicious && isFiniteNumber(currentPnlPct) && mgmtConfig.stopLossPct != null && currentPnlPct <= mgmtConfig.stopLossPct) {
     return {
       action: "STOP_LOSS",
       reason: `Stop loss: PnL ${currentPnlPct.toFixed(2)}% <= ${mgmtConfig.stopLossPct}%`,
@@ -515,7 +563,7 @@ export function updatePnlAndCheckExits(position_address, positionData, mgmtConfi
   }
 
   // ── Trailing TP ────────────────────────────────────────────────
-  if (!pnl_pct_suspicious && pos.trailing_active) {
+  if (!pnl_pct_suspicious && isFiniteNumber(currentPnlPct) && pos.trailing_active) {
     const dropFromPeak = pos.peak_pnl_pct - currentPnlPct;
     if (dropFromPeak >= mgmtConfig.trailingDropPct) {
       return {

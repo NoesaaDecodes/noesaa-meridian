@@ -25,7 +25,7 @@ import {
   createLiveMessage,
 } from "./telegram.js";
 import { generateBriefing } from "./briefing.js";
-import { getLastBriefingDate, setLastBriefingDate, getTrackedPosition, getTrackedPositions, setPositionInstruction, updatePnlAndCheckExits, queuePeakConfirmation, resolvePendingPeak, queueTrailingDropConfirmation, resolvePendingTrailingDrop, trackPaperPosition, getPaperPositions, closePaperPosition, getPaperPnlSummary } from "./state.js";
+import { getLastBriefingDate, setLastBriefingDate, getTrackedPosition, getTrackedPositions, setPositionInstruction, updatePnlAndCheckExits, queuePeakConfirmation, resolvePendingPeak, queueTrailingDropConfirmation, resolvePendingTrailingDrop, trackPaperPosition, getPaperPositions, closePaperPosition, getPaperPnlSummary, updatePaperPositionPnl } from "./state.js";
 import { getActiveStrategy } from "./strategy-library.js";
 import { recordPositionSnapshot, recallForPool, addPoolNote } from "./pool-memory.js";
 import { checkSmartWalletsOnPool } from "./smart-wallets.js";
@@ -115,17 +115,60 @@ function shouldUsePnlRecheck() {
   return !config.api.lpAgentRelayEnabled;
 }
 
+function isFiniteNumber(value) {
+  return typeof value === "number" && Number.isFinite(value);
+}
+
+function formatPct(value) {
+  return isFiniteNumber(value) ? `${value.toFixed(2)}%` : "unavailable";
+}
+
+async function refreshPaperPositionPnl(pp) {
+  const binData = await getActiveBin({ pool_address: pp.pool });
+  const currentPrice = binData.price;
+  const activeBin = binData.binId;
+  let pnlPct = null;
+  let inRange = true;
+
+  if (pp.entry_price_sol && pp.entry_price_sol > 0 && isFiniteNumber(currentPrice)) {
+    pnlPct = Math.round(((currentPrice - pp.entry_price_sol) / pp.entry_price_sol) * 10000) / 100;
+  }
+
+  const lowerBin = pp.bin_range?.min ?? null;
+  const upperBin = pp.bin_range?.max ?? null;
+  if (lowerBin != null && upperBin != null && activeBin != null) {
+    inRange = activeBin >= lowerBin && activeBin <= upperBin;
+  }
+
+  updatePaperPositionPnl(pp.position, { pnl_pct: pnlPct, current_price_sol: currentPrice, active_bin: activeBin, in_range: inRange });
+  return { pnl_pct: pnlPct, current_price_sol: currentPrice, active_bin: activeBin, in_range: inRange };
+}
+
 function schedulePeakConfirmation(positionAddress) {
   if (!positionAddress || _peakConfirmTimers.has(positionAddress)) return;
 
   const timer = setTimeout(async () => {
     _peakConfirmTimers.delete(positionAddress);
     try {
-      const result = await getMyPositions({ force: true, silent: true }).catch(() => null);
-      const position = result?.positions?.find((p) => p.position === positionAddress);
-      resolvePendingPeak(positionAddress, position?.pnl_pct ?? null, TRAILING_PEAK_CONFIRM_TOLERANCE);
+      const tracked = getTrackedPosition(positionAddress);
+      let currentPnlPct = null;
+      if (tracked?.paper) {
+        currentPnlPct = (await refreshPaperPositionPnl(tracked)).pnl_pct;
+      } else {
+        const result = await getMyPositions({ force: true, silent: true }).catch(() => null);
+        const position = result?.positions?.find((p) => p.position === positionAddress);
+        currentPnlPct = position?.pnl_pct ?? null;
+      }
+      const resolved = resolvePendingPeak(positionAddress, currentPnlPct, TRAILING_PEAK_CONFIRM_TOLERANCE);
+      if (resolved?.deferred) {
+        schedulePeakConfirmation(positionAddress);
+      }
     } catch (error) {
       log("state_warn", `Peak confirmation failed for ${positionAddress}: ${error.message}`);
+      const resolved = resolvePendingPeak(positionAddress, null, TRAILING_PEAK_CONFIRM_TOLERANCE);
+      if (resolved?.deferred) {
+        schedulePeakConfirmation(positionAddress);
+      }
     }
   }, TRAILING_PEAK_CONFIRM_DELAY_MS);
 
@@ -138,20 +181,38 @@ function scheduleTrailingDropConfirmation(positionAddress) {
   const timer = setTimeout(async () => {
     _trailingDropConfirmTimers.delete(positionAddress);
     try {
-      const result = await getMyPositions({ force: true, silent: true }).catch(() => null);
-      const position = result?.positions?.find((p) => p.position === positionAddress);
+      const tracked = getTrackedPosition(positionAddress);
+      let currentPnlPct = null;
+      if (tracked?.paper) {
+        currentPnlPct = (await refreshPaperPositionPnl(tracked)).pnl_pct;
+      } else {
+        const result = await getMyPositions({ force: true, silent: true }).catch(() => null);
+        const position = result?.positions?.find((p) => p.position === positionAddress);
+        currentPnlPct = position?.pnl_pct ?? null;
+      }
       const resolved = resolvePendingTrailingDrop(
         positionAddress,
-        position?.pnl_pct ?? null,
+        currentPnlPct,
         config.management.trailingDropPct,
         TRAILING_DROP_CONFIRM_TOLERANCE_PCT,
       );
       if (resolved?.confirmed) {
         log("state", `[Trailing recheck] Confirmed trailing exit for ${positionAddress} — triggering management`);
         runManagementCycle({ silent: true }).catch((e) => log("cron_error", `Trailing recheck management failed: ${e.message}`));
+      } else if (resolved?.deferred) {
+        scheduleTrailingDropConfirmation(positionAddress);
       }
     } catch (error) {
       log("state_warn", `Trailing drop confirmation failed for ${positionAddress}: ${error.message}`);
+      const resolved = resolvePendingTrailingDrop(
+        positionAddress,
+        null,
+        config.management.trailingDropPct,
+        TRAILING_DROP_CONFIRM_TOLERANCE_PCT,
+      );
+      if (resolved?.deferred) {
+        scheduleTrailingDropConfirmation(positionAddress);
+      }
     }
   }, TRAILING_DROP_CONFIRM_DELAY_MS);
 
@@ -221,25 +282,25 @@ export async function runManagementCycle({ silent = false } = {}) {
       for (const pp of paperPositionsRaw) {
         const tracked = getTrackedPosition(pp.position);
         let currentPrice = null;
-        let pnlPct = 0;
+        let pnlPct = isFiniteNumber(tracked?.last_paper_pnl_pct) ? tracked.last_paper_pnl_pct : null;
         let inRange = true;
         let activeBin = null;
+        let pnlRefreshOk = false;
+        let refreshError = null;
         try {
-          const { getActiveBin } = await import("./tools/dlmm.js");
-          const binData = await getActiveBin({ pool_address: pp.pool });
-          currentPrice = binData.price;
-          activeBin = binData.binId;
-          if (pp.entry_price_sol && pp.entry_price_sol > 0) {
-            pnlPct = Math.round(((currentPrice - pp.entry_price_sol) / pp.entry_price_sol) * 10000) / 100;
-          }
-          const lowerBin = pp.bin_range?.min ?? null;
-          const upperBin = pp.bin_range?.max ?? null;
-          if (lowerBin != null && upperBin != null) {
-            inRange = activeBin >= lowerBin && activeBin <= upperBin;
-          }
+          const refreshed = await refreshPaperPositionPnl(pp);
+          currentPrice = refreshed.current_price_sol;
+          activeBin = refreshed.active_bin;
+          inRange = refreshed.in_range;
+          pnlPct = refreshed.pnl_pct;
+          pnlRefreshOk = isFiniteNumber(pnlPct);
         } catch (e) {
-          log("paper_warn", `Failed to fetch price for paper position ${pp.pool_name}: ${e.message}`);
-          inRange = true; // reset — don't trust stale OOR state when fetch fails
+          refreshError = e.message;
+          pnlRefreshOk = false;
+          inRange = typeof tracked?.last_paper_in_range === "boolean" ? tracked.last_paper_in_range : true;
+          activeBin = tracked?.last_paper_active_bin ?? null;
+          updatePaperPositionPnl(pp.position, { refresh_error: refreshError });
+          log("paper_warn", `Failed to refresh paper PnL for ${pp.pool_name}: ${refreshError}; using ${isFiniteNumber(pnlPct) ? `last known ${formatPct(pnlPct)}` : "unavailable PnL"} and skipping PnL exits`);
         }
         const ageMinutes = pp.deployed_at ? Math.floor((Date.now() - new Date(pp.deployed_at).getTime()) / 60000) : 0;
         const oorSince = !inRange ? (tracked?.out_of_range_since || new Date().toISOString()) : null;
@@ -256,7 +317,8 @@ export async function runManagementCycle({ silent = false } = {}) {
           total_value_usd: pp.amount_sol ? Math.round(pp.amount_sol * 10000) / 10000 : 0,
           pnl_usd: 0,
           pnl_pct: pnlPct,
-          pnl_pct_suspicious: false,
+          pnl_pct_suspicious: !pnlRefreshOk,
+          pnl_refresh_error: refreshError,
           fee_per_tvl_24h: pp.fee_tvl_ratio ?? null,
           age_minutes: ageMinutes,
           minutes_out_of_range: oorSince ? Math.floor((Date.now() - new Date(oorSince).getTime()) / 60000) : 0,
@@ -285,6 +347,10 @@ export async function runManagementCycle({ silent = false } = {}) {
     // JS trailing TP check
     const exitMap = new Map();
     for (const p of positionData) {
+      if (p.paper && p.pnl_pct_suspicious) {
+        log("paper_warn", `Paper position ${p.pair} has no fresh PnL; holding and skipping exit rules this cycle`);
+        continue;
+      }
       if (
         !p.pnl_pct_suspicious &&
         queuePeakConfirmation(p.position, p.pnl_pct, { immediate: !shouldUsePnlRecheck() }) &&
@@ -343,7 +409,8 @@ export async function runManagementCycle({ silent = false } = {}) {
       const val = config.management.solMode ? `◎${p.total_value_usd ?? "?"}` : `$${p.total_value_usd ?? "?"}`;
       const unclaimed = config.management.solMode ? `◎${p.unclaimed_fees_usd ?? "?"}` : `$${p.unclaimed_fees_usd ?? "?"}`;
       const statusLabel = act.action === "INSTRUCTION" ? "HOLD (instruction)" : act.action;
-      let line = `**${p.pair}** | Age: ${p.age_minutes ?? "?"}m | Val: ${val} | Unclaimed: ${unclaimed} | PnL: ${p.pnl_pct ?? "?"}% | Yield: ${p.fee_per_tvl_24h ?? "?"}% | ${inRange} | ${statusLabel}`;
+      const pnlLabel = p.pnl_pct_suspicious ? `${formatPct(p.pnl_pct)} stale` : formatPct(p.pnl_pct);
+      let line = `**${p.pair}** | Age: ${p.age_minutes ?? "?"}m | Val: ${val} | Unclaimed: ${unclaimed} | PnL: ${pnlLabel} | Yield: ${p.fee_per_tvl_24h ?? "?"}% | ${inRange} | ${statusLabel}`;
       if (p.instruction) line += `\nNote: "${p.instruction}"`;
       if (act.action === "CLOSE" && act.rule === "exit") line += `\n⚡ Trailing TP: ${act.reason}`;
       if (act.action === "CLOSE" && act.rule && act.rule !== "exit") line += `\nRule ${act.rule}: ${act.reason}`;
@@ -1025,6 +1092,9 @@ function formatCandidates(candidates) {
 
 function getDeterministicCloseRule(position, managementConfig) {
   const tracked = getTrackedPosition(position.position);
+  if (position.pnl_pct_suspicious) {
+    return null;
+  }
   const pnlSuspect = (() => {
     if (position.pnl_pct == null) return false;
     if (position.pnl_pct > -90) return false;
