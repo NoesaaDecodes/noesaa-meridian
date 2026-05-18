@@ -38,6 +38,10 @@ if (u.llmModel)  process.env.LLM_MODEL          ||= u.llmModel;
 if (u.llmBaseUrl) process.env.LLM_BASE_URL      ||= u.llmBaseUrl;
 if (u.llmApiKey)  process.env.LLM_API_KEY       ||= u.llmApiKey;
 if (u.dryRun !== undefined) process.env.DRY_RUN ||= String(u.dryRun);
+if (process.env.PAPER_ONLY === "true" || u.paperOnly === true) {
+  process.env.PAPER_ONLY = "true";
+  process.env.DRY_RUN = "true";
+}
 if (u.publicApiKey) process.env.PUBLIC_API_KEY ||= u.publicApiKey;
 if (u.agentMeridianApiUrl) process.env.AGENT_MERIDIAN_API_URL ||= u.agentMeridianApiUrl;
 
@@ -57,6 +61,17 @@ export const config = {
   risk: {
     maxPositions:    u.maxPositions    ?? 3,
     maxDeployAmount: u.maxDeployAmount ?? 50,
+  },
+
+  paper: {
+    enabled: process.env.PAPER_ONLY === "true" || u.paperOnly === true,
+    startingBalanceSol: Number(process.env.PAPER_STARTING_BALANCE_SOL ?? u.paperStartingBalanceSol ?? 5),
+    maxOpenPositions: Number(process.env.PAPER_MAX_OPEN_POSITIONS ?? u.paperMaxOpenPositions ?? u.maxPaperPositions ?? u.maxPositions ?? 3),
+    positionSizePct: Number(process.env.PAPER_POSITION_SIZE_PCT ?? u.paperPositionSizePct ?? u.positionSizePct ?? 0.35),
+    minDeploySol: Number(process.env.PAPER_MIN_DEPLOY_SOL ?? u.paperMinDeploySol ?? u.deployAmountSol ?? 0.5),
+    maxDeploySol: Number(process.env.PAPER_MAX_DEPLOY_SOL ?? u.paperMaxDeploySol ?? u.maxDeployAmount ?? 50),
+    gasReserveSol: Number(process.env.PAPER_GAS_RESERVE_SOL ?? u.paperGasReserveSol ?? 0),
+    cooldownMinutesAfterClose: Number(process.env.PAPER_POOL_COOLDOWN_MINUTES ?? u.paperPoolCooldownMinutes ?? 60),
   },
 
   // ─── Pool Screening Thresholds ───────────
@@ -134,6 +149,13 @@ export const config = {
     managementIntervalMin:  u.managementIntervalMin  ?? 5,
     screeningIntervalMin:   u.screeningIntervalMin   ?? 15,
     healthCheckIntervalMin: u.healthCheckIntervalMin ?? 60,
+  },
+
+  telegram: {
+    digestMode: u.telegram?.digestMode ?? u.telegramDigestMode ?? true,
+    verboseCycles: u.telegram?.verboseCycles ?? u.telegramVerboseCycles ?? false,
+    minNotifyIntervalSec: u.telegram?.minNotifyIntervalSec ?? u.telegramMinNotifyIntervalSec ?? 300,
+    verbosity: u.telegram?.verbosity ?? u.telegramVerbosity ?? "normal",
   },
 
   // ─── LLM Settings ──────────────────────

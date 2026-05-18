@@ -2,6 +2,7 @@ import fs from "fs";
 import path from "path";
 import { fileURLToPath } from "url";
 import { log } from "./logger.js";
+import { config } from "./config.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const USER_CONFIG_PATH = path.join(__dirname, "user-config.json");
@@ -21,6 +22,80 @@ let _polling = false;
 let _liveMessageDepth = 0;
 let _warnedMissingChatId = false;
 let _warnedMissingAllowedUsers = false;
+const _lastNotifyAt = new Map();
+const _digestItems = new Map();
+let _digestTimer = null;
+
+const PRIORITY = {
+  critical: { icon: "🚨", rank: 4 },
+  high: { icon: "🔴", rank: 3 },
+  medium: { icon: "🟡", rank: 2 },
+  low: { icon: "🟢", rank: 1 },
+  info: { icon: "ℹ️", rank: 0 },
+};
+
+function telegramConfig() {
+  return {
+    digestMode: config.telegram?.digestMode !== false,
+    verboseCycles: config.telegram?.verboseCycles === true,
+    minNotifyIntervalSec: Number(config.telegram?.minNotifyIntervalSec ?? 300),
+    verbosity: config.telegram?.verbosity || "normal",
+  };
+}
+
+function shouldCooldown(key, priority) {
+  if (!key || priority === "critical") return false;
+  const minMs = Math.max(0, telegramConfig().minNotifyIntervalSec) * 1000;
+  if (minMs <= 0) return false;
+  const last = _lastNotifyAt.get(key);
+  const now = Date.now();
+  if (last && now - last < minMs) return true;
+  _lastNotifyAt.set(key, now);
+  return false;
+}
+
+function digestKey(event) {
+  return event.key || `${event.type || "event"}:${event.title || ""}`;
+}
+
+async function flushDigestNow() {
+  if (_digestTimer) clearTimeout(_digestTimer);
+  _digestTimer = null;
+  if (!_digestItems.size) return null;
+  const items = [..._digestItems.values()];
+  _digestItems.clear();
+  const lines = ["🧾 <b>Operator Digest</b>"];
+  for (const item of items.slice(0, 12)) {
+    const meta = item.count > 1 ? ` x${item.count}` : "";
+    lines.push(`${item.icon} <b>${escapeHtml(item.title)}</b>${meta}${item.text ? `\n${escapeHtml(item.text)}` : ""}`);
+  }
+  if (items.length > 12) lines.push(`…and ${items.length - 12} more`);
+  return sendHTML(lines.join("\n\n"), { bypassDigest: true, priority: "high" });
+}
+
+function queueDigest(event) {
+  const key = digestKey(event);
+  const existing = _digestItems.get(key);
+  if (existing) {
+    existing.count += 1;
+    existing.text = event.text || existing.text;
+    existing.icon = event.icon || existing.icon;
+  } else {
+    _digestItems.set(key, { ...event, count: 1 });
+  }
+  if (!_digestTimer) {
+    _digestTimer = setTimeout(() => {
+      flushDigestNow().catch((e) => log("telegram_warn", `Digest flush failed: ${e.message}`));
+    }, 60_000);
+  }
+}
+
+function escapeHtml(value) {
+  return String(value ?? "")
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;");
+}
 
 // ─── chatId persistence ──────────────────────────────────────────
 function loadChatId() {
@@ -123,8 +198,9 @@ async function postTelegramRaw(method, body) {
   }
 }
 
-export async function sendMessage(text) {
+export async function sendMessage(text, options = {}) {
   if (!TOKEN || !chatId) return;
+  if (options.key && shouldCooldown(options.key, options.priority || "medium")) return null;
   return postTelegram("sendMessage", { text: String(text).slice(0, 4096) });
 }
 
@@ -136,8 +212,9 @@ export async function sendMessageWithButtons(text, inlineKeyboard) {
   });
 }
 
-export async function sendHTML(html) {
+export async function sendHTML(html, options = {}) {
   if (!TOKEN || !chatId) return;
+  if (options.key && shouldCooldown(options.key, options.priority || "medium")) return null;
   return postTelegram("sendMessage", { text: html.slice(0, 4096), parse_mode: "HTML" });
 }
 
@@ -168,6 +245,46 @@ export async function answerCallbackQuery(callbackQueryId, text = "") {
 
 export function hasActiveLiveMessage() {
   return _liveMessageDepth > 0;
+}
+
+export async function notifyOperator({
+  type = "event",
+  title,
+  text = "",
+  priority = "medium",
+  key = null,
+  digest = true,
+} = {}) {
+  const cfg = telegramConfig();
+  const meta = PRIORITY[priority] || PRIORITY.medium;
+  const event = {
+    type,
+    title: title || type,
+    text,
+    priority,
+    key: key || `${type}:${title || ""}`,
+    icon: meta.icon,
+  };
+
+  if (shouldCooldown(event.key, priority)) return null;
+
+  const shouldDigest =
+    cfg.digestMode &&
+    digest &&
+    meta.rank <= PRIORITY.medium.rank &&
+    !cfg.verboseCycles;
+
+  if (shouldDigest) {
+    queueDigest(event);
+    return null;
+  }
+
+  const html = `${event.icon} <b>${escapeHtml(event.title)}</b>${text ? `\n${escapeHtml(text)}` : ""}`;
+  return sendHTML(html, { bypassDigest: true, priority, key: null });
+}
+
+export async function flushTelegramDigest() {
+  return flushDigestNow();
 }
 
 function createTypingIndicator() {
@@ -248,8 +365,10 @@ function summarizeToolResult(name, result) {
   }
 }
 
-export async function createLiveMessage(title, intro = "Starting...") {
+export async function createLiveMessage(title, intro = "Starting...", options = {}) {
   if (!TOKEN || !chatId) return null;
+  const cfg = telegramConfig();
+  if (options.cycle === true && cfg.digestMode && !cfg.verboseCycles) return null;
   const typing = createTypingIndicator();
 
   const state = {
@@ -410,6 +529,15 @@ export async function notifyDeploy({ pair, amountSol, position, tx, priceRange, 
   const poolStr = (binStep || baseFee)
     ? `Bin step: ${binStep ?? "?"}  |  Base fee: ${baseFee != null ? baseFee + "%" : "?"}\n`
     : "";
+  await notifyOperator({
+    type: "deploy",
+    priority: "high",
+    key: `deploy:${position || pair}`,
+    digest: false,
+    title: `Deploy opened: ${pair}`,
+    text: `Amount: ${amountSol} SOL\n${priceStr}${coverageStr}${poolStr}Position: ${position?.slice(0, 8) || "?"}...\nTx: ${tx?.slice(0, 16) || "n/a"}...`,
+  });
+  return;
   await sendHTML(
     `✅ <b>Deployed</b> ${pair}\n` +
     `Amount: ${amountSol} SOL\n` +
@@ -424,6 +552,15 @@ export async function notifyDeploy({ pair, amountSol, position, tx, priceRange, 
 export async function notifyClose({ pair, pnlUsd, pnlPct }) {
   if (hasActiveLiveMessage()) return;
   const sign = pnlUsd >= 0 ? "+" : "";
+  await notifyOperator({
+    type: "close",
+    priority: "high",
+    key: `close:${pair}:${pnlPct}`,
+    digest: false,
+    title: `Position closed: ${pair}`,
+    text: `PnL: ${sign}$${(pnlUsd ?? 0).toFixed(2)} (${sign}${(pnlPct ?? 0).toFixed(2)}%)`,
+  });
+  return;
   await sendHTML(
     `🔒 <b>Closed</b> ${pair}\n` +
     `PnL: ${sign}$${(pnlUsd ?? 0).toFixed(2)} (${sign}${(pnlPct ?? 0).toFixed(2)}%)`
@@ -432,6 +569,15 @@ export async function notifyClose({ pair, pnlUsd, pnlPct }) {
 
 export async function notifySwap({ inputSymbol, outputSymbol, amountIn, amountOut, tx }) {
   if (hasActiveLiveMessage()) return;
+  await notifyOperator({
+    type: "swap",
+    priority: "medium",
+    key: `swap:${inputSymbol}:${outputSymbol}`,
+    title: `Swapped ${inputSymbol} to ${outputSymbol}`,
+    text: `In: ${amountIn ?? "?"} | Out: ${amountOut ?? "?"}\nTx: ${tx?.slice(0, 16) || "n/a"}...`,
+    digest: true,
+  });
+  return;
   await sendHTML(
     `🔄 <b>Swapped</b> ${inputSymbol} → ${outputSymbol}\n` +
     `In: ${amountIn ?? "?"} | Out: ${amountOut ?? "?"}\n` +
@@ -441,10 +587,81 @@ export async function notifySwap({ inputSymbol, outputSymbol, amountIn, amountOu
 
 export async function notifyOutOfRange({ pair, minutesOOR }) {
   if (hasActiveLiveMessage()) return;
+  await notifyOperator({
+    type: "oor",
+    priority: "medium",
+    key: `oor:${pair}`,
+    title: `Out of range: ${pair}`,
+    text: `Been OOR for ${minutesOOR} minutes`,
+    digest: true,
+  });
+  return;
   await sendHTML(
     `⚠️ <b>Out of Range</b> ${pair}\n` +
     `Been OOR for ${minutesOOR} minutes`
   );
+}
+
+export async function notifyPaperDeploy({ pair, amountSol, position, balanceSol }) {
+  await notifyOperator({
+    type: "paper_deploy",
+    priority: "high",
+    key: `paper_deploy:${position || pair}`,
+    digest: false,
+    title: `Paper deploy opened: ${pair}`,
+    text: `Amount: ${amountSol} SOL\nPosition: ${position?.slice(0, 10) || "?"}\nVirtual balance: ${balanceSol ?? "?"} SOL`,
+  });
+}
+
+export async function notifyPaperClose({ pair, pnlPct, pnlSol, reason, balanceSol }) {
+  await notifyOperator({
+    type: "paper_close",
+    priority: "high",
+    key: `paper_close:${pair}:${reason}:${pnlPct}`,
+    digest: false,
+    title: `Paper position closed: ${pair}`,
+    text: `PnL: ${fmtPct(pnlPct)} (${pnlSol ?? "?"} SOL)\nReason: ${reason || "unknown"}\nVirtual balance: ${balanceSol ?? "?"} SOL`,
+  });
+}
+
+export async function notifyExitSignal({ pair, action, reason, pnlPct }) {
+  const actionText = String(action || "").toLowerCase();
+  const priority = actionText.includes("stop") ? "critical" : "high";
+  await notifyOperator({
+    type: "exit",
+    priority,
+    key: `exit:${pair}:${action}`,
+    digest: false,
+    title: `${action || "Exit"} triggered: ${pair}`,
+    text: `${reason || ""}${pnlPct != null ? `\nPnL: ${fmtPct(pnlPct)}` : ""}`,
+  });
+}
+
+export async function notifyRuntimeError({ scope, error }) {
+  await notifyOperator({
+    type: "runtime_error",
+    priority: "critical",
+    key: `runtime_error:${scope}`,
+    digest: false,
+    title: `Runtime error: ${scope}`,
+    text: error?.message || error || "unknown error",
+  });
+}
+
+export async function notifyLifecycleMilestone({ title, text }) {
+  await notifyOperator({ type: "lifecycle", priority: "medium", key: `lifecycle:${title}`, title, text, digest: true });
+}
+
+export async function notifyDailyPerformanceDigest({ title = "Daily performance digest", text }) {
+  await notifyOperator({ type: "daily_digest", priority: "medium", key: `daily_digest:${new Date().toISOString().slice(0, 10)}`, title, text, digest: false });
+}
+
+export async function notifyStartup({ mode, text }) {
+  await notifyOperator({ type: "startup", priority: "high", key: `startup:${mode}`, title: `Startup: ${mode}`, text, digest: false });
+}
+
+export async function notifyShutdown({ signal, text }) {
+  await notifyOperator({ type: "shutdown", priority: "high", key: `shutdown:${signal}`, title: `Shutdown: ${signal}`, text, digest: false });
 }
 
 function sleep(ms) {

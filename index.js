@@ -21,11 +21,20 @@ import {
   editMessageWithButtons,
   answerCallbackQuery,
   notifyOutOfRange,
+  notifyOperator,
+  notifyPaperDeploy,
+  notifyPaperClose,
+  notifyExitSignal,
+  notifyRuntimeError,
+  notifyStartup,
+  notifyShutdown,
+  notifyDailyPerformanceDigest,
+  flushTelegramDigest,
   isEnabled as telegramEnabled,
   createLiveMessage,
 } from "./telegram.js";
 import { generateBriefing } from "./briefing.js";
-import { getLastBriefingDate, setLastBriefingDate, getTrackedPosition, getTrackedPositions, setPositionInstruction, updatePnlAndCheckExits, queuePeakConfirmation, resolvePendingPeak, queueTrailingDropConfirmation, resolvePendingTrailingDrop, trackPaperPosition, getPaperPositions, closePaperPosition, getPaperPnlSummary, updatePaperPositionPnl } from "./state.js";
+import { getLastBriefingDate, setLastBriefingDate, getTrackedPosition, getTrackedPositions, setPositionInstruction, updatePnlAndCheckExits, queuePeakConfirmation, resolvePendingPeak, queueTrailingDropConfirmation, resolvePendingTrailingDrop, trackPaperPosition, getPaperPositions, closePaperPosition, getPaperPnlSummary, updatePaperPositionPnl, initPaperAccount, getPaperAccount, computePaperDeployAmount, canOpenPaperPosition } from "./state.js";
 import { getActiveStrategy } from "./strategy-library.js";
 import { recordPositionSnapshot, recallForPool, addPoolNote } from "./pool-memory.js";
 import { checkSmartWalletsOnPool } from "./smart-wallets.js";
@@ -40,9 +49,26 @@ const isMain = entrypointPath
   ? path.resolve(entrypointPath) === fileURLToPath(import.meta.url)
   : false;
 
+function isPaperOnlyMode() {
+  return process.env.PAPER_ONLY === "true" || config.paper?.enabled === true;
+}
+
+if (isPaperOnlyMode()) {
+  process.env.PAPER_ONLY = "true";
+  process.env.DRY_RUN = "true";
+}
+
 if (isMain) {
   log("startup", "DLMM LP Agent starting...");
-  log("startup", `Mode: ${process.env.DRY_RUN === "true" ? "DRY RUN" : "LIVE"}`);
+  if (isPaperOnlyMode()) {
+    const account = initPaperAccount({ startingBalanceSol: config.paper.startingBalanceSol });
+    log("startup", "PAPER MODE ENABLED - simulated lifecycle only, no on-chain transactions");
+    log("startup", `Paper balance: ${account.available_balance_sol} SOL available | max open: ${config.paper.maxOpenPositions} | cooldown: ${config.paper.cooldownMinutesAfterClose}m`);
+    notifyStartup({ mode: "PAPER", text: `${account.available_balance_sol} SOL virtual balance | max open ${config.paper.maxOpenPositions}` }).catch(() => {});
+  } else {
+    log("startup", `Mode: ${process.env.DRY_RUN === "true" ? "DRY RUN" : "LIVE"}`);
+    notifyStartup({ mode: process.env.DRY_RUN === "true" ? "DRY RUN" : "LIVE", text: `Model: ${process.env.LLM_MODEL || "hermes-3-405b"}` }).catch(() => {});
+  }
   log("startup", `Model: ${process.env.LLM_MODEL || "hermes-3-405b"}`);
   ensureAgentId();
   bootstrapHiveMind().catch((error) => log("hivemind_warn", `Bootstrap failed: ${error.message}`));
@@ -121,6 +147,18 @@ function isFiniteNumber(value) {
 
 function formatPct(value) {
   return isFiniteNumber(value) ? `${value.toFixed(2)}%` : "unavailable";
+}
+
+function paperOptions() {
+  return {
+    startingBalanceSol: config.paper.startingBalanceSol,
+    maxOpenPositions: config.paper.maxOpenPositions,
+    positionSizePct: config.paper.positionSizePct,
+    minDeploySol: config.paper.minDeploySol,
+    maxDeploySol: config.paper.maxDeploySol,
+    gasReserveSol: config.paper.gasReserveSol,
+    cooldownMinutesAfterClose: config.paper.cooldownMinutesAfterClose,
+  };
 }
 
 async function refreshPaperPositionPnl(pp) {
@@ -224,7 +262,7 @@ async function runBriefing() {
   try {
     const briefing = await generateBriefing();
     if (telegramEnabled()) {
-      await sendHTML(briefing);
+      await notifyDailyPerformanceDigest({ text: stripThink(briefing).slice(0, 3500) });
     }
     setLastBriefingDate();
   } catch (error) {
@@ -269,13 +307,14 @@ export async function runManagementCycle({ silent = false } = {}) {
 
   try {
     if (!silent && telegramEnabled()) {
-      liveMessage = await createLiveMessage("🔄 Management Cycle", "Evaluating positions...");
+      liveMessage = await createLiveMessage("🔄 Management Cycle", "Evaluating positions...", { cycle: true });
     }
-    const livePositions = await getMyPositions({ force: true }).catch(() => null);
+    const paperOnly = isPaperOnlyMode();
+    const livePositions = paperOnly ? null : await getMyPositions({ force: true }).catch(() => null);
     positions = livePositions?.positions || [];
 
     // ── Paper Trading: merge simulated positions in dry-run mode ──
-    const isDryRun = process.env.DRY_RUN === "true";
+    const isDryRun = process.env.DRY_RUN === "true" || paperOnly;
     const paperPositionsRaw = isDryRun ? getPaperPositions(true) : [];
     if (paperPositionsRaw.length > 0) {
       const paperFormatted = [];
@@ -368,6 +407,7 @@ export async function runManagementCycle({ silent = false } = {}) {
         }
         exitMap.set(p.position, exit.reason);
         log("state", `Exit alert for ${p.pair}: ${exit.reason}`);
+        notifyExitSignal({ pair: p.pair, action: exit.action, reason: exit.reason, pnlPct: p.pnl_pct }).catch(() => {});
       }
     }
 
@@ -428,6 +468,15 @@ export async function runManagementCycle({ silent = false } = {}) {
       `\n\nSummary: 💼 ${positions.length} positions | ${cur}${totalValue.toFixed(4)} | fees: ${cur}${totalUnclaimed.toFixed(4)} | ${actionSummary}`;
 
     // ── Paper trading summary in management report ───────────────
+    notifyOperator({
+      type: "cycle_summary",
+      priority: needsAction.length > 0 ? "medium" : "low",
+      key: needsAction.length > 0 ? `management:actions:${needsAction.length}` : "management:stay",
+      title: "Management cycle",
+      text: `${positions.length} positions | ${actionSummary}`,
+      digest: true,
+    }).catch(() => {});
+
     if (isDryRun) {
       const paper = getPaperPnlSummary();
       if (paper.open_count > 0 || paper.closed_count > 0) {
@@ -470,6 +519,13 @@ export async function runManagementCycle({ silent = false } = {}) {
           }).catch((e) => log("paper_warn", `Failed to record paper performance: ${e.message}`));
           log("paper", `Paper closed: ${p.pair} — ${act.reason} — PnL ${pnlPct.toFixed(2)}% (${pnlSol} SOL)`);
           mgmtReport += `\n📄 Paper closed: ${p.pair} | ${act.reason} | PnL ${pnlPct.toFixed(2)}% (${pnlSol} SOL)`;
+          notifyPaperClose({
+            pair: p.pair,
+            pnlPct,
+            pnlSol,
+            reason: act.reason || "rule",
+            balanceSol: getPaperAccount().available_balance_sol,
+          }).catch(() => {});
         }
       }
     }
@@ -521,21 +577,23 @@ After executing, write a brief one-line result per position.
     }
 
     // Trigger screening after management
-    const afterPositions = await getMyPositions({ force: true }).catch(() => null);
-    const afterCount = afterPositions?.positions?.length ?? 0;
-    if (afterCount < config.risk.maxPositions && Date.now() - _screeningLastTriggered > screeningCooldownMs) {
+    const afterPositions = isPaperOnlyMode() ? null : await getMyPositions({ force: true }).catch(() => null);
+    const afterCount = isPaperOnlyMode() ? getPaperPositions(true).length : afterPositions?.positions?.length ?? 0;
+    const maxOpen = isPaperOnlyMode() ? config.paper.maxOpenPositions : config.risk.maxPositions;
+    if (afterCount < maxOpen && Date.now() - _screeningLastTriggered > screeningCooldownMs) {
       log("cron", `Post-management: ${afterCount}/${config.risk.maxPositions} positions — triggering screening`);
       runScreeningCycle().catch((e) => log("cron_error", `Triggered screening failed: ${e.message}`));
     }
   } catch (error) {
     log("cron_error", `Management cycle failed: ${error.message}`);
     mgmtReport = `Management cycle failed: ${error.message}`;
+    notifyRuntimeError({ scope: "management", error }).catch(() => {});
   } finally {
     _managementBusy = false;
     if (!silent && telegramEnabled()) {
       if (mgmtReport) {
         if (liveMessage) await liveMessage.finalize(stripThink(mgmtReport)).catch(() => {});
-        else sendMessage(`🔄 Management Cycle\n\n${stripThink(mgmtReport)}`).catch(() => { });
+        else if (config.telegram.verboseCycles || !config.telegram.digestMode) sendMessage(`🔄 Management Cycle\n\n${stripThink(mgmtReport)}`, { key: "cycle:management", priority: "low" }).catch(() => { });
       }
       for (const p of positions) {
         if (!p.in_range && p.minutes_out_of_range >= config.management.outOfRangeWaitMinutes) {
@@ -560,8 +618,17 @@ export async function runScreeningCycle({ silent = false } = {}) {
   let liveMessage = null;
   let screenReport = null;
   try {
-    [prePositions, preBalance] = await Promise.all([getMyPositions({ force: true }), getWalletBalances()]);
-    if (prePositions.total_positions >= config.risk.maxPositions) {
+    const paperOnly = isPaperOnlyMode();
+    if (paperOnly) {
+      const account = initPaperAccount({ startingBalanceSol: config.paper.startingBalanceSol });
+      const openPaper = getPaperPositions(true);
+      prePositions = { total_positions: openPaper.length, positions: openPaper };
+      preBalance = { sol: account.available_balance_sol };
+    } else {
+      [prePositions, preBalance] = await Promise.all([getMyPositions({ force: true }), getWalletBalances()]);
+    }
+    const maxOpen = paperOnly ? config.paper.maxOpenPositions : config.risk.maxPositions;
+    if (prePositions.total_positions >= maxOpen) {
       log("cron", `Screening skipped — max positions reached (${prePositions.total_positions}/${config.risk.maxPositions})`);
       screenReport = `Screening skipped — max positions reached (${prePositions.total_positions}/${config.risk.maxPositions}).`;
       appendDecision({
@@ -573,8 +640,8 @@ export async function runScreeningCycle({ silent = false } = {}) {
       _screeningBusy = false;
       return screenReport;
     }
-    const minRequired = config.management.deployAmountSol + config.management.gasReserve;
-    const isDryRun = process.env.DRY_RUN === "true";
+    const minRequired = paperOnly ? config.paper.minDeploySol : config.management.deployAmountSol + config.management.gasReserve;
+    const isDryRun = process.env.DRY_RUN === "true" || paperOnly;
     if (!isDryRun && preBalance.sol < minRequired) {
       log("cron", `Screening skipped — insufficient SOL (${preBalance.sol.toFixed(3)} < ${minRequired} needed for deploy + gas)`);
       screenReport = `Screening skipped — insufficient SOL (${preBalance.sol.toFixed(3)} < ${minRequired} needed for deploy + gas).`;
@@ -590,19 +657,27 @@ export async function runScreeningCycle({ silent = false } = {}) {
   } catch (e) {
     log("cron_error", `Screening pre-check failed: ${e.message}`);
     screenReport = `Screening pre-check failed: ${e.message}`;
+    notifyRuntimeError({ scope: "screening pre-check", error: e }).catch(() => {});
     _screeningBusy = false;
     return screenReport;
   }
   if (!silent && telegramEnabled()) {
-    liveMessage = await createLiveMessage("🔍 Screening Cycle", "Scanning candidates...");
+    liveMessage = await createLiveMessage("🔍 Screening Cycle", "Scanning candidates...", { cycle: true });
   }
   timers.screeningLastRun = Date.now();
   log("cron", `Starting screening cycle [model: ${config.llm.screeningModel}]`);
   try {
     // Reuse pre-fetched balance — no extra RPC call needed
     const currentBalance = preBalance;
-    const deployAmount = computeDeployAmount(currentBalance.sol);
-    log("cron", `Computed deploy amount: ${deployAmount} SOL (wallet: ${currentBalance.sol} SOL)`);
+    const deployAmount = isPaperOnlyMode()
+      ? computePaperDeployAmount(paperOptions())
+      : computeDeployAmount(currentBalance.sol);
+    log("cron", `${isPaperOnlyMode() ? "Computed paper deploy amount" : "Computed deploy amount"}: ${deployAmount} SOL (balance: ${currentBalance.sol} SOL)`);
+    if (isPaperOnlyMode() && deployAmount <= 0) {
+      screenReport = `Paper screening skipped - virtual balance ${currentBalance.sol.toFixed(3)} SOL is below deploy minimum.`;
+      log("paper", screenReport);
+      return screenReport;
+    }
 
     // Load active strategy
     const activeStrategy = getActiveStrategy();
@@ -784,7 +859,7 @@ export async function runScreeningCycle({ silent = false } = {}) {
     const { content } = await agentLoop(`
 SCREENING CYCLE
 ${strategyBlock}
-Positions: ${prePositions.total_positions}/${config.risk.maxPositions} | SOL: ${currentBalance.sol.toFixed(3)} | Deploy: ${deployAmount} SOL
+Positions: ${prePositions.total_positions}/${isPaperOnlyMode() ? config.paper.maxOpenPositions : config.risk.maxPositions} | SOL: ${currentBalance.sol.toFixed(3)} | Deploy: ${deployAmount} SOL
 
 PRE-LOADED CANDIDATES (${passing.length} pools):
 ${candidateBlocks.join("\n\n")}
@@ -866,6 +941,16 @@ IMPORTANT:
               const wd = result.would_deploy || {};
               const fakeId = `paper_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
               const poolAddress = wd.pool_address || args?.pool_address;
+              const paperAmount = wd.amount_y ?? args?.amount_y ?? args?.amount_sol ?? 0;
+              const paperCheck = canOpenPaperPosition(
+                { pool: poolAddress, amount_sol: paperAmount },
+                paperOptions(),
+              );
+              if (!paperCheck.ok) {
+                deploySucceeded = false;
+                log("paper_warn", `Paper deploy rejected after dry-run result: ${paperCheck.reason}`);
+                return;
+              }
               let entryPrice = null;
               try {
                 const { getActiveBin } = await import("./tools/dlmm.js");
@@ -873,21 +958,33 @@ IMPORTANT:
                 entryPrice = bin.price;
               } catch (e) { log("paper_warn", `Could not fetch entry price: ${e.message}`); }
               const activeBinId = args?.active_bin ?? null;
-              trackPaperPosition({
+              const trackedPaper = trackPaperPosition({
                 position: fakeId,
                 pool: poolAddress,
                 pool_name: args?.pool_name || poolAddress?.slice(0, 8),
                 strategy: wd.strategy || args?.strategy,
                 bin_range: { min: activeBinId != null ? activeBinId - (wd.bins_below ?? 0) : null, max: activeBinId != null ? activeBinId + (wd.bins_above ?? 0) : null },
-                amount_sol: wd.amount_y ?? args?.amount_y ?? args?.amount_sol ?? 0,
+                amount_sol: paperAmount,
                 active_bin: activeBinId,
                 bin_step: args?.bin_step ?? null,
                 volatility: args?.volatility ?? null,
                 fee_tvl_ratio: args?.fee_tvl_ratio ?? null,
                 organic_score: args?.organic_score ?? null,
                 entry_price_sol: entryPrice,
+                paper_options: paperOptions(),
               });
-              log("paper", `Paper position saved: ${fakeId} in ${args?.pool_name || poolAddress?.slice(0, 8)}`);
+              if (!trackedPaper?.ok) {
+                deploySucceeded = false;
+                log("paper_warn", `Paper position not saved: ${trackedPaper?.reason || "unknown rejection"}`);
+                return;
+              }
+              log("paper", `Paper position saved: ${fakeId} in ${args?.pool_name || poolAddress?.slice(0, 8)} | amount ${paperAmount} SOL`);
+              notifyPaperDeploy({
+                pair: args?.pool_name || poolAddress?.slice(0, 8),
+                amountSol: paperAmount,
+                position: fakeId,
+                balanceSol: getPaperAccount().available_balance_sol,
+              }).catch(() => {});
             }
           }
           await liveMessage?.toolFinish(name, result, success);
@@ -912,12 +1009,13 @@ IMPORTANT:
   } catch (error) {
     log("cron_error", `Screening cycle failed: ${error.message}`);
     screenReport = `Screening cycle failed: ${error.message}`;
+    notifyRuntimeError({ scope: "screening", error }).catch(() => {});
   } finally {
     _screeningBusy = false;
     if (!silent && telegramEnabled()) {
       if (screenReport) {
         if (liveMessage) await liveMessage.finalize(stripThink(screenReport)).catch(() => {});
-        else sendMessage(`🔍 Screening Cycle\n\n${stripThink(screenReport)}`).catch(() => { });
+        else if (config.telegram.verboseCycles || !config.telegram.digestMode) sendMessage(`🔍 Screening Cycle\n\n${stripThink(screenReport)}`, { key: "cycle:screening", priority: "low" }).catch(() => { });
       }
     }
   }
@@ -926,6 +1024,13 @@ IMPORTANT:
 
 export function startCronJobs() {
   stopCronJobs(); // stop any running tasks before (re)starting
+  if (isPaperOnlyMode()) {
+    process.env.PAPER_ONLY = "true";
+    process.env.DRY_RUN = "true";
+    const account = initPaperAccount({ startingBalanceSol: config.paper.startingBalanceSol });
+    log("startup", "PAPER MODE STARTED - screening, simulated entries, management, lifecycle logging only");
+    log("startup", `Paper account: ${account.available_balance_sol} SOL available, ${account.deployed_balance_sol} SOL deployed, max open ${config.paper.maxOpenPositions}`);
+  }
 
   const mgmtTask = cron.schedule(`*/${Math.max(1, config.schedule.managementIntervalMin)} * * * *`, async () => {
     if (_managementBusy) return;
@@ -1060,9 +1165,12 @@ async function shutdown(signal) {
   );
   if (positions) {
     log("shutdown", `Open positions at shutdown: ${positions.total_positions}`);
+    await notifyShutdown({ signal, text: `Open positions: ${positions.total_positions}` }).catch(() => {});
   } else {
     log("shutdown", "Open position snapshot skipped during shutdown timeout");
+    await notifyShutdown({ signal, text: "Open position snapshot skipped during shutdown timeout" }).catch(() => {});
   }
+  await flushTelegramDigest().catch(() => {});
   process.exit(0);
 }
 
