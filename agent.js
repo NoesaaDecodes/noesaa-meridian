@@ -183,6 +183,63 @@ function isToolChoiceRequiredError(error) {
   return /tool_choice/i.test(message) && /required/i.test(message);
 }
 
+function deployAttemptKey(args = {}) {
+  return args.pool_address || args.pool || args.poolAddress || null;
+}
+
+export function createToolRetryGuard() {
+  const onceSucceeded = new Set();
+  const deployAttempts = new Set();
+  let deployInFlight = false;
+
+  return {
+    reserve(functionName, functionArgs = {}) {
+      if (functionName === "deploy_position") {
+        if (onceSucceeded.has(functionName)) {
+          return {
+            allowed: false,
+            reason: "deploy_position already succeeded this session - do not open another position.",
+          };
+        }
+        if (deployInFlight) {
+          return {
+            allowed: false,
+            reason: "deploy_position already has an in-flight attempt this step - wait for the safety result before evaluating another candidate.",
+          };
+        }
+        const key = deployAttemptKey(functionArgs);
+        if (key && deployAttempts.has(key)) {
+          return {
+            allowed: false,
+            reason: `deploy_position already attempted for pool ${key} this session - mark that candidate rejected and evaluate a different candidate.`,
+          };
+        }
+        if (key) deployAttempts.add(key);
+        deployInFlight = true;
+        return { allowed: true };
+      }
+
+      if (onceSucceeded.has(functionName)) {
+        return {
+          allowed: false,
+          reason: `${functionName} already attempted this session - do not retry. If it failed, report the error and stop.`,
+        };
+      }
+      return { allowed: true };
+    },
+    recordResult(functionName, result = {}) {
+      if (functionName === "deploy_position") {
+        deployInFlight = false;
+        if (result?.success === true && !result?.error && !result?.blocked) {
+          onceSucceeded.add(functionName);
+        }
+        return;
+      }
+      if (result?.success === true) onceSucceeded.add(functionName);
+    },
+  };
+}
+
 /**
  * Core ReAct agent loop.
  *
@@ -217,9 +274,7 @@ export async function agentLoop(goal, maxSteps = config.llm.maxSteps, sessionHis
   // Track write tools fired this session — prevent the model from calling the same
   // destructive tool twice (e.g. deploy twice, swap twice after auto-swap)
   const ONCE_PER_SESSION = new Set(["deploy_position", "swap_token", "close_position"]);
-  // These lock after first attempt regardless of success — retrying them is always wrong
-  const NO_RETRY_TOOLS = new Set(["deploy_position"]);
-  const firedOnce = new Set();
+  const retryGuard = createToolRetryGuard();
   const mustUseRealTool = shouldRequireRealToolUse(goal, agentType, interactive);
   let sawToolCall = false;
   let noToolRetryCount = 0;
@@ -382,25 +437,31 @@ export async function agentLoop(goal, maxSteps = config.llm.maxSteps, sessionHis
           }
         }
 
-        // Block once-per-session tools from firing a second time
-        if (ONCE_PER_SESSION.has(functionName) && firedOnce.has(functionName)) {
-          log("agent", `Blocked duplicate ${functionName} call — already executed this session`);
-          await onToolFinish?.({
-            name: functionName,
-            args: functionArgs,
-            result: { blocked: true, reason: `${functionName} already attempted this session — do not retry. If it failed, report the error and stop.` },
-            success: false,
-            step,
-          });
-          return {
-            role: "tool",
-            tool_call_id: toolCall.id,
-            content: JSON.stringify({ blocked: true, reason: `${functionName} already attempted this session — do not retry. If it failed, report the error and stop.` }),
-          };
+        if (ONCE_PER_SESSION.has(functionName)) {
+          const retryCheck = retryGuard.reserve(functionName, functionArgs);
+          if (!retryCheck.allowed) {
+            log("agent", `Blocked duplicate ${functionName} call - ${retryCheck.reason}`);
+            const result = { blocked: true, duplicate_retry: true, reason: retryCheck.reason };
+            await onToolFinish?.({
+              name: functionName,
+              args: functionArgs,
+              result,
+              success: false,
+              step,
+            });
+            return {
+              role: "tool",
+              tool_call_id: toolCall.id,
+              content: JSON.stringify(result),
+            };
+          }
         }
 
         await onToolStart?.({ name: functionName, args: functionArgs, step });
         const result = await executeTool(functionName, functionArgs);
+        if (functionName === "deploy_position" && result?.blocked && result?.type === "safety_filter") {
+          log("agent", `Deploy candidate rejected by safety filter: ${functionArgs.pool_address || "unknown pool"} - ${result.reason}`);
+        }
         await onToolFinish?.({
           name: functionName,
           args: functionArgs,
@@ -409,10 +470,7 @@ export async function agentLoop(goal, maxSteps = config.llm.maxSteps, sessionHis
           step,
         });
 
-        // Lock deploy_position after first attempt regardless of outcome — retrying is never right
-        // For close/swap: only lock on success so genuine failures can be retried
-        if (NO_RETRY_TOOLS.has(functionName)) firedOnce.add(functionName);
-        else if (ONCE_PER_SESSION.has(functionName) && result.success === true) firedOnce.add(functionName);
+        if (ONCE_PER_SESSION.has(functionName)) retryGuard.recordResult(functionName, result);
 
         return {
           role: "tool",

@@ -214,6 +214,9 @@ async function postTelegram(method, body) {
     });
     if (!res.ok) {
       const err = await res.text();
+      if (method === "editMessageText" && /message is not modified/i.test(err)) {
+        return null;
+      }
       log("telegram_error", `${method} ${res.status}: ${err.slice(0, 200)}`);
       return null;
     }

@@ -406,6 +406,7 @@ function getDlmmInstructionDiscriminators(serialized) {
 // ─── Pool Cache ────────────────────────────────────────────────
 const poolCache = new Map();
 const poolMetadataCache = new Map();
+const POOL_DISCOVERY_BASE = "https://pool-discovery-api.datapi.meteora.ag";
 
 async function getPool(poolAddress) {
   const key = poolAddress.toString();
@@ -462,6 +463,51 @@ export async function getActiveBin({ pool_address }) {
     binId: activeBin.binId,
     price: pool.fromPricePerLamport(Number(activeBin.price)),
     pricePerLamport: activeBin.price.toString(),
+  };
+}
+
+function extractPoolDiscoveryActiveBin(pool) {
+  const candidates = [
+    pool?.active_bin,
+    pool?.active_bin_id,
+    pool?.activeBin,
+    pool?.activeBinId,
+    pool?.pool_active_bin_id,
+    pool?.poolActiveBinId,
+    pool?.dlmm_params?.active_bin,
+    pool?.dlmm_params?.active_bin_id,
+  ];
+  for (const value of candidates) {
+    const n = Number(value);
+    if (Number.isFinite(n)) return n;
+  }
+  return null;
+}
+
+export async function getPoolMarketSnapshot({ pool_address, timeframe = config.screening?.timeframe || "5m" }) {
+  pool_address = normalizeMint(pool_address);
+  const filter = encodeURIComponent(`pool_address=${pool_address}`);
+  const encodedTimeframe = encodeURIComponent(timeframe);
+  const url = `${POOL_DISCOVERY_BASE}/pools?page_size=1&filter_by=${filter}&timeframe=${encodedTimeframe}`;
+  const res = await fetch(url);
+  if (!res.ok) {
+    const error = new Error(`Pool Discovery API error: ${res.status} ${res.statusText}`);
+    error.provider = "Meteora Pool Discovery";
+    error.status = res.status;
+    throw error;
+  }
+  const data = await res.json();
+  const pool = (data?.data || [])[0] ?? null;
+  if (!pool) throw new Error(`Pool ${pool_address} not found in Pool Discovery`);
+  return {
+    pool: pool_address,
+    source: "Meteora Pool Discovery",
+    timeframe,
+    price: safeNum(pool.pool_price || pool.price || pool.current_price || pool.token_x_price_in_y),
+    active_bin: extractPoolDiscoveryActiveBin(pool),
+    volume: maybeNum(pool.volume),
+    fee_active_tvl_ratio: maybeNum(pool.fee_active_tvl_ratio),
+    fetched_at: new Date().toISOString(),
   };
 }
 
@@ -1106,6 +1152,8 @@ export async function getPositionPnl({ pool_address, position_address }) {
       const p = payload?.positions?.find((position) => position.position === position_address);
       if (p) {
         return {
+          pnl_source: "live_pnl",
+          provider: "Agent Meridian relay",
           pnl_usd: p.pnl_usd,
           pnl_pct: p.pnl_pct,
           current_value_usd: p.total_value_usd,
@@ -1142,6 +1190,8 @@ export async function getPositionPnl({ pool_address, position_address }) {
       : maybeNum(p.pnlPctChange);
     const derivedPnlPct = deriveOpenPnlPct(p, solMode);
     return {
+      pnl_source: "live_pnl",
+      provider: "Meteora DLMM PnL API",
       pnl_usd:           roundNum(solMode ? p.pnlSol : p.pnlUsd, 4),
       pnl_pct:           roundNum(reportedPnlPct ?? derivedPnlPct ?? 0, 2),
       current_value_usd: roundNum(currentValue, 4),

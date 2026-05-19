@@ -781,6 +781,8 @@ export function updatePaperPositionPnl(position_address, {
   active_bin,
   in_range,
   volume,
+  entry_price_sol,
+  pnl_source = null,
   refresh_error = null,
 } = {}) {
   const state = load();
@@ -797,16 +799,21 @@ export function updatePaperPositionPnl(position_address, {
       ? Math.min(pos.paper_min_unrealized_pnl_pct, pnl_pct)
       : pnl_pct;
     pos.last_paper_price_sol = isFiniteNumber(current_price_sol) ? current_price_sol : pos.last_paper_price_sol ?? null;
+    if (!isFiniteNumber(pos.entry_price_sol) && isFiniteNumber(entry_price_sol) && entry_price_sol > 0) {
+      pos.entry_price_sol = entry_price_sol;
+    }
     pos.last_paper_active_bin = active_bin ?? pos.last_paper_active_bin ?? null;
     pos.last_paper_in_range = typeof in_range === "boolean" ? in_range : pos.last_paper_in_range ?? true;
     if (isFiniteNumber(volume)) pos.last_paper_volume = volume;
     updatePaperRangeAccounting(pos, now, in_range);
     pos.last_paper_pnl_at = now;
+    pos.last_paper_pnl_source = pnl_source || "paper_simulated_pnl";
     pos.last_paper_pnl_error = null;
   } else if (refresh_error) {
     pos.paper_failed_refresh_count = (pos.paper_failed_refresh_count || 0) + 1;
     pos.last_paper_pnl_error = sanitizeStoredText(refresh_error, 180);
     pos.last_paper_pnl_error_at = now;
+    pos.last_paper_pnl_source = pnl_source || "stale_pnl";
   }
 
   save(state);

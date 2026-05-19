@@ -159,6 +159,63 @@ test("live deploy verification endpoint failures still block deploy", () => {
   assert.equal(result.authFailure, true);
 });
 
+test("deploy verification logs metric source and mismatch audit", () => {
+  resetState();
+  const code = `
+    process.env.MERIDIAN_STATE_FILE = ${JSON.stringify(stateFile)};
+    process.env.PAPER_ONLY = "false";
+    process.env.DRY_RUN = "true";
+    globalThis.fetch = async () => ({
+      ok: true,
+      async json() {
+        return { data: [{
+          pool_address: "Pool111111111111111111111111111111111111111",
+          tvl: 50000,
+          active_tvl: 50000,
+          fee_active_tvl_ratio: 0.005,
+          volatility: 1,
+          dlmm_params: { bin_step: 100 },
+        }] };
+      },
+      async text() { return ""; },
+    });
+    const { config } = await import(${JSON.stringify(pathToFileURL(path.resolve("config.js")).href)});
+    config.screening.minFeeActiveTvlRatio = 0.02;
+    config.screening.timeframe = "5m";
+    const { executeTool } = await import(${JSON.stringify(pathToFileURL(path.resolve("tools/executor.js")).href)});
+    const result = await executeTool("deploy_position", {
+      pool_address: "Pool111111111111111111111111111111111111111",
+      amount_y: 0.05,
+      amount_x: 0,
+      bins_below: 35,
+      bins_above: 0,
+      volatility: 1,
+      fee_tvl_ratio: 0.53,
+      bin_step: 100,
+    });
+    console.log("RESULT:" + JSON.stringify(result));
+    process.exit(0);
+  `;
+  const child = spawnSync(process.execPath, ["--input-type=module", "-e", code], {
+    cwd: path.resolve("."),
+    encoding: "utf8",
+    env: { ...process.env, PAPER_ONLY: "false", DRY_RUN: "true" },
+    timeout: 10_000,
+  });
+  assert.equal(child.status, 0, child.stderr || child.stdout);
+  assert.match(child.stdout, /DEPLOY_VERIFY/);
+  assert.match(child.stdout, /screening_metric=fee_active_tvl_ratio/);
+  assert.match(child.stdout, /deploy_verification_metric=fee_active_tvl_ratio/);
+  assert.match(child.stdout, /Metric mismatch/);
+
+  const line = child.stdout.split(/\r?\n/).find((entry) => entry.startsWith("RESULT:"));
+  assert.ok(line, child.stdout);
+  const result = JSON.parse(line.slice("RESULT:".length));
+  assert.equal(result.blocked, true);
+  assert.equal(result.metric_audit.screening_metric.value, 0.53);
+  assert.equal(result.metric_audit.deploy_verification_metric.value, 0.005);
+});
+
 test("toxic token symbols and names are rejected", async () => {
   const { getToxicTokenRejectReason } = await import("../tools/screening.js");
 
@@ -174,6 +231,153 @@ test("toxic token symbols and names are rejected", async () => {
     name: "CLEAN-SOL",
     base: { symbol: "CLEAN" },
   }), null);
+});
+
+test("agent retry guard blocks same deploy after safety rejection but allows next candidate", () => {
+  const code = `
+    process.env.OPENAI_API_KEY = "test-key";
+    const { createToolRetryGuard } = await import(${JSON.stringify(pathToFileURL(path.resolve("agent.js")).href)});
+    const guard = createToolRetryGuard();
+    const first = guard.reserve("deploy_position", { pool_address: "pool_a" });
+    const parallel = guard.reserve("deploy_position", { pool_address: "pool_b" });
+    guard.recordResult("deploy_position", { blocked: true, type: "safety_filter", reason: "fee too low" });
+    const duplicate = guard.reserve("deploy_position", { pool_address: "pool_a" });
+    const next = guard.reserve("deploy_position", { pool_address: "pool_b" });
+    console.log("RESULT:" + JSON.stringify({ first, parallel, duplicate, next }));
+    process.exit(0);
+  `;
+  const child = spawnSync(process.execPath, ["--input-type=module", "-e", code], {
+    cwd: path.resolve("."),
+    encoding: "utf8",
+    env: { ...process.env, OPENAI_API_KEY: "test-key" },
+    timeout: 10_000,
+  });
+  assert.equal(child.status, 0, child.stderr || child.stdout);
+  const line = child.stdout.split(/\r?\n/).find((entry) => entry.startsWith("RESULT:"));
+  assert.ok(line, child.stdout);
+  const result = JSON.parse(line.slice("RESULT:".length));
+  assert.equal(result.first.allowed, true);
+  assert.equal(result.parallel.allowed, false);
+  assert.match(result.parallel.reason, /in-flight attempt/);
+  assert.equal(result.duplicate.allowed, false);
+  assert.match(result.duplicate.reason, /already attempted for pool pool_a/);
+  assert.equal(result.next.allowed, true);
+});
+
+test("PAPER_ONLY PnL refresh uses market data without RPC or relay endpoint", () => {
+  resetState();
+  state.initPaperAccount({ startingBalanceSol: 0.5 });
+  state.trackPaperPosition({
+    position: "paper_pnl_refresh",
+    pool: "Pool111111111111111111111111111111111111111",
+    pool_name: "PNL-SOL",
+    strategy: "bid_ask",
+    bin_range: { min: 95, max: 105 },
+    amount_sol: 0.05,
+    active_bin: 100,
+    entry_price_sol: 1,
+    paper_options: {
+      startingBalanceSol: 0.5,
+      maxOpenPositions: 2,
+      minDeploySol: 0.05,
+      maxDeploySol: 0.1,
+    },
+  });
+
+  const code = `
+    process.env.MERIDIAN_STATE_FILE = ${JSON.stringify(stateFile)};
+    process.env.PAPER_ONLY = "true";
+    process.env.DRY_RUN = "true";
+    process.env.OPENAI_API_KEY = "test-key";
+    delete process.env.RPC_URL;
+    globalThis.fetch = async (url) => {
+      const text = String(url);
+      if (!text.startsWith("https://pool-discovery-api.datapi.meteora.ag/")) {
+        throw new Error("unexpected endpoint " + text);
+      }
+      return {
+        ok: true,
+        async json() {
+          return { data: [{
+            pool_address: "Pool111111111111111111111111111111111111111",
+            pool_price: 1.1,
+            active_bin: 102,
+            volume: 1234,
+            fee_active_tvl_ratio: 0.05,
+          }] };
+        },
+        async text() { return ""; },
+      };
+    };
+    const { refreshPaperPositionPnl } = await import(${JSON.stringify(pathToFileURL(path.resolve("index.js")).href)});
+    const { getTrackedPosition } = await import(${JSON.stringify(pathToFileURL(path.resolve("state.js")).href)});
+    const result = await refreshPaperPositionPnl(getTrackedPosition("paper_pnl_refresh"));
+    console.log("RESULT:" + JSON.stringify({ result, stored: getTrackedPosition("paper_pnl_refresh") }));
+    process.exit(0);
+  `;
+  const child = spawnSync(process.execPath, ["--input-type=module", "-e", code], {
+    cwd: path.resolve("."),
+    encoding: "utf8",
+    env: { ...process.env, PAPER_ONLY: "true", DRY_RUN: "true", OPENAI_API_KEY: "test-key", RPC_URL: "" },
+    timeout: 10_000,
+  });
+  assert.equal(child.status, 0, child.stderr || child.stdout);
+  assert.doesNotMatch(child.stdout + child.stderr, /Endpoint URL must start/i);
+  assert.match(child.stdout, /Paper simulated PnL refreshed/);
+  const line = child.stdout.split(/\r?\n/).find((entry) => entry.startsWith("RESULT:"));
+  assert.ok(line, child.stdout);
+  const { result, stored } = JSON.parse(line.slice("RESULT:".length));
+  assert.equal(result.pnl_source, "paper_simulated_pnl");
+  assert.equal(result.market_source, "Meteora Pool Discovery");
+  assert.equal(result.pnl_pct, 10);
+  assert.equal(result.in_range, true);
+  assert.equal(stored.last_paper_pnl_source, "paper_simulated_pnl");
+  assert.equal(stored.last_paper_active_bin, 102);
+});
+
+test("paper PnL refresh initializes missing entry price from market data", () => {
+  resetState();
+  state.initPaperAccount({ startingBalanceSol: 0.5 });
+  state.trackPaperPosition({
+    position: "paper_pnl_entry",
+    pool: "Pool222222222222222222222222222222222222222",
+    pool_name: "ENTRY-SOL",
+    strategy: "bid_ask",
+    bin_range: { min: 95, max: 105 },
+    amount_sol: 0.05,
+    active_bin: 100,
+    paper_options: { startingBalanceSol: 0.5, maxOpenPositions: 2 },
+  });
+
+  const code = `
+    process.env.MERIDIAN_STATE_FILE = ${JSON.stringify(stateFile)};
+    process.env.PAPER_ONLY = "true";
+    process.env.DRY_RUN = "true";
+    process.env.OPENAI_API_KEY = "test-key";
+    globalThis.fetch = async () => ({
+      ok: true,
+      async json() { return { data: [{ pool_price: 2, active_bin: 100 }] }; },
+      async text() { return ""; },
+    });
+    const { refreshPaperPositionPnl } = await import(${JSON.stringify(pathToFileURL(path.resolve("index.js")).href)});
+    const { getTrackedPosition } = await import(${JSON.stringify(pathToFileURL(path.resolve("state.js")).href)});
+    const result = await refreshPaperPositionPnl(getTrackedPosition("paper_pnl_entry"));
+    console.log("RESULT:" + JSON.stringify({ result, stored: getTrackedPosition("paper_pnl_entry") }));
+    process.exit(0);
+  `;
+  const child = spawnSync(process.execPath, ["--input-type=module", "-e", code], {
+    cwd: path.resolve("."),
+    encoding: "utf8",
+    env: { ...process.env, PAPER_ONLY: "true", DRY_RUN: "true", OPENAI_API_KEY: "test-key" },
+    timeout: 10_000,
+  });
+  assert.equal(child.status, 0, child.stderr || child.stdout);
+  const line = child.stdout.split(/\r?\n/).find((entry) => entry.startsWith("RESULT:"));
+  assert.ok(line, child.stdout);
+  const { result, stored } = JSON.parse(line.slice("RESULT:".length));
+  assert.equal(result.pnl_pct, 0);
+  assert.equal(stored.entry_price_sol, 2);
+  assert.equal(stored.last_paper_pnl_source, "paper_simulated_pnl");
 });
 
 test("paper mode uses exploratory fee threshold without changing live default", () => {

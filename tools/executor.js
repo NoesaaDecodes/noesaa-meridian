@@ -121,6 +121,53 @@ function poolDetailVolatility(pool) {
   return numberOrNull(pool?.volatility);
 }
 
+function deployMetricAudit(args, detail, timeframe) {
+  const screeningMetric = numberOrNull(args?.fee_tvl_ratio ?? args?.fee_active_tvl_ratio);
+  const liveMetric = poolDetailFeeActiveTvlRatio(detail);
+  const threshold = numberOrNull(config.screening.minFeeActiveTvlRatio);
+  const audit = {
+    screening_metric: {
+      name: "fee_active_tvl_ratio",
+      label: "screening cached fee/active-TVL",
+      value: screeningMetric,
+      source: "deploy_position args from cached screening candidate",
+      timeframe,
+    },
+    deploy_verification_metric: {
+      name: "fee_active_tvl_ratio",
+      label: "deploy verification live fee/active-TVL",
+      value: liveMetric,
+      source: "Meteora Pool Discovery live fetch",
+      timeframe,
+    },
+    cached_metric: {
+      value: screeningMetric,
+      source: "candidate cache / LLM tool args",
+      timeframe,
+    },
+    live_metric: {
+      value: liveMetric,
+      source: "fresh deploy verification fetch",
+      timeframe,
+    },
+    threshold,
+  };
+
+  log(
+    "deploy_verify",
+    `Metric audit pool=${args?.pool_address} screening_metric=fee_active_tvl_ratio cached=${screeningMetric ?? "unknown"} timeframe=${timeframe} source=candidate_args; deploy_verification_metric=fee_active_tvl_ratio live=${liveMetric ?? "unknown"} timeframe=${timeframe} source=Meteora Pool Discovery; threshold=${threshold ?? "none"}`,
+  );
+
+  if (screeningMetric != null && liveMetric != null && Math.abs(screeningMetric - liveMetric) > 0.0001) {
+    log(
+      "deploy_verify_warn",
+      `Metric mismatch pool=${args?.pool_address} cached_fee_active_tvl_ratio=${screeningMetric} live_fee_active_tvl_ratio=${liveMetric} timeframe=${timeframe}`,
+    );
+  }
+
+  return audit;
+}
+
 async function fetchFreshPoolDetail(poolAddress, timeframe = config.screening.timeframe || "5m") {
   const encodedTimeframe = encodeURIComponent(timeframe);
   const filter = encodeURIComponent(`pool_address=${poolAddress}`);
@@ -138,8 +185,9 @@ async function fetchFreshPoolDetail(poolAddress, timeframe = config.screening.ti
 
 async function validateDeployPoolThresholds(args) {
   let detail;
+  const screeningTimeframe = config.screening.timeframe || "5m";
   try {
-    detail = await fetchFreshPoolDetail(args.pool_address);
+    detail = await fetchFreshPoolDetail(args.pool_address, screeningTimeframe);
     if (!detail) throw new Error(`Pool ${args.pool_address} not found`);
   } catch (error) {
     const classified = classifyApiError(error, error.provider || "Meteora Pool Discovery");
@@ -158,6 +206,7 @@ async function validateDeployPoolThresholds(args) {
     };
   }
 
+  const metricAudit = deployMetricAudit(args, detail, screeningTimeframe);
   const tvl = poolDetailTvl(detail);
   const minTvl = numberOrNull(config.screening.minTvl);
   const maxTvl = numberOrNull(config.screening.maxTvl);
@@ -194,6 +243,7 @@ async function validateDeployPoolThresholds(args) {
       pass: false,
       type: "safety_filter",
       reason: `SAFETY FILTER: Pool fee/active-TVL ${feeActiveTvlRatio ?? "unknown"}% is below configured minFeeActiveTvlRatio ${minFeeActiveTvlRatio}%.`,
+      metric_audit: metricAudit,
     };
   }
 
@@ -238,7 +288,7 @@ async function validateDeployPoolThresholds(args) {
     };
   }
 
-  return { pass: true };
+  return { pass: true, metric_audit: metricAudit };
 }
 
 // Registered by index.js so update_config can restart cron jobs when intervals change
@@ -662,6 +712,7 @@ export async function executeTool(name, args) {
         provider: safetyCheck.provider || null,
         authFailure: safetyCheck.authFailure === true,
         reason: safetyCheck.reason,
+        metric_audit: safetyCheck.metric_audit || null,
       };
     }
   }

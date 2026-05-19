@@ -5,7 +5,7 @@ import path from "path";
 import { fileURLToPath } from "url";
 import { agentLoop } from "./agent.js";
 import { log } from "./logger.js";
-import { getMyPositions, closePosition, getActiveBin } from "./tools/dlmm.js";
+import { getMyPositions, closePosition, getActiveBin, getPoolMarketSnapshot } from "./tools/dlmm.js";
 import { getWalletBalances } from "./tools/wallet.js";
 import { getTopCandidates } from "./tools/screening.js";
 import { classifyApiError, config, getApiAuthWarnings, reloadScreeningThresholds, computeDeployAmount } from "./config.js";
@@ -164,6 +164,16 @@ function formatPct(value) {
   return isFiniteNumber(value) ? `${value.toFixed(2)}%` : "unavailable";
 }
 
+const _paperPnlWarnAt = new Map();
+
+function logPaperPnlWarning(key, message, cooldownMs = 5 * 60 * 1000) {
+  const now = Date.now();
+  const last = _paperPnlWarnAt.get(key) || 0;
+  if (now - last < cooldownMs) return;
+  _paperPnlWarnAt.set(key, now);
+  log("paper_warn", message);
+}
+
 function paperOptions() {
   return {
     startingBalanceSol: config.paper.startingBalanceSol,
@@ -176,15 +186,21 @@ function paperOptions() {
   };
 }
 
-async function refreshPaperPositionPnl(pp) {
-  const binData = await getActiveBin({ pool_address: pp.pool });
-  const currentPrice = binData.price;
-  const activeBin = binData.binId;
+export async function refreshPaperPositionPnl(pp) {
+  const snapshot = await getPoolMarketSnapshot({
+    pool_address: pp.pool,
+    timeframe: config.screening.timeframe || "5m",
+  });
+  const currentPrice = snapshot.price;
+  const activeBin = snapshot.active_bin ?? pp.last_paper_active_bin ?? pp.active_bin_at_deploy ?? null;
   let pnlPct = null;
   let inRange = true;
+  const entryPrice = isFiniteNumber(pp.entry_price_sol) && pp.entry_price_sol > 0
+    ? pp.entry_price_sol
+    : currentPrice;
 
-  if (pp.entry_price_sol && pp.entry_price_sol > 0 && isFiniteNumber(currentPrice)) {
-    pnlPct = Math.round(((currentPrice - pp.entry_price_sol) / pp.entry_price_sol) * 10000) / 100;
+  if (isFiniteNumber(entryPrice) && entryPrice > 0 && isFiniteNumber(currentPrice)) {
+    pnlPct = Math.round(((currentPrice - entryPrice) / entryPrice) * 10000) / 100;
   }
 
   const lowerBin = pp.bin_range?.min ?? null;
@@ -193,8 +209,25 @@ async function refreshPaperPositionPnl(pp) {
     inRange = activeBin >= lowerBin && activeBin <= upperBin;
   }
 
-  updatePaperPositionPnl(pp.position, { pnl_pct: pnlPct, current_price_sol: currentPrice, active_bin: activeBin, in_range: inRange });
-  return { pnl_pct: pnlPct, current_price_sol: currentPrice, active_bin: activeBin, in_range: inRange };
+  updatePaperPositionPnl(pp.position, {
+    pnl_pct: pnlPct,
+    current_price_sol: currentPrice,
+    active_bin: activeBin,
+    in_range: inRange,
+    volume: snapshot.volume,
+    entry_price_sol: pp.entry_price_sol || entryPrice,
+    pnl_source: "paper_simulated_pnl",
+  });
+  log("paper_pnl", `Paper simulated PnL refreshed for ${pp.pool_name || pp.pool}: ${formatPct(pnlPct)} | source=${snapshot.source} timeframe=${snapshot.timeframe}`);
+  return {
+    pnl_pct: pnlPct,
+    current_price_sol: currentPrice,
+    active_bin: activeBin,
+    in_range: inRange,
+    pnl_source: "paper_simulated_pnl",
+    market_source: snapshot.source,
+    stale: false,
+  };
 }
 
 function schedulePeakConfirmation(positionAddress) {
@@ -353,8 +386,11 @@ export async function runManagementCycle({ silent = false } = {}) {
           pnlRefreshOk = false;
           inRange = typeof tracked?.last_paper_in_range === "boolean" ? tracked.last_paper_in_range : true;
           activeBin = tracked?.last_paper_active_bin ?? null;
-          updatePaperPositionPnl(pp.position, { refresh_error: refreshError });
-          log("paper_warn", `Failed to refresh paper PnL for ${pp.pool_name}: ${refreshError}; using ${isFiniteNumber(pnlPct) ? `last known ${formatPct(pnlPct)}` : "unavailable PnL"} and skipping PnL exits`);
+          updatePaperPositionPnl(pp.position, { refresh_error: refreshError, pnl_source: "stale_pnl" });
+          logPaperPnlWarning(
+            `${pp.position}:${refreshError}`,
+            `Stale paper PnL for ${pp.pool_name || pp.pool}: ${refreshError}; using ${isFiniteNumber(pnlPct) ? `last known ${formatPct(pnlPct)}` : "unavailable PnL"} and skipping PnL exits`,
+          );
         }
         const ageMinutes = pp.deployed_at ? Math.floor((Date.now() - new Date(pp.deployed_at).getTime()) / 60000) : 0;
         const oorSince = !inRange ? (tracked?.out_of_range_since || new Date().toISOString()) : null;
@@ -372,6 +408,7 @@ export async function runManagementCycle({ silent = false } = {}) {
           pnl_usd: 0,
           pnl_pct: pnlPct,
           pnl_pct_suspicious: !pnlRefreshOk,
+          pnl_source: pnlRefreshOk ? "paper_simulated_pnl" : "stale_pnl",
           pnl_refresh_error: refreshError,
           fee_per_tvl_24h: pp.fee_tvl_ratio ?? null,
           age_minutes: ageMinutes,
@@ -1107,9 +1144,38 @@ Summarize the current portfolio health, total fees earned, and performance of al
     if (getTrackedPositions(true).length === 0) return;
     _pnlPollBusy = true;
     try {
-      const result = await getMyPositions({ force: true, silent: true }).catch(() => null);
-      if (!result?.positions?.length) return;
-      for (const p of result.positions) {
+      let pollPositions = [];
+      if (isPaperOnlyMode()) {
+        for (const pp of getPaperPositions(true)) {
+          const tracked = getTrackedPosition(pp.position) || pp;
+          try {
+            const refreshed = await refreshPaperPositionPnl(tracked);
+            pollPositions.push({
+              position: pp.position,
+              pool: pp.pool,
+              pair: pp.pool_name || pp.pool.slice(0, 8),
+              pnl_pct: refreshed.pnl_pct,
+              pnl_pct_suspicious: !isFiniteNumber(refreshed.pnl_pct),
+              pnl_source: "paper_simulated_pnl",
+              in_range: refreshed.in_range,
+              fee_per_tvl_24h: pp.fee_tvl_ratio ?? null,
+              age_minutes: pp.deployed_at ? Math.floor((Date.now() - new Date(pp.deployed_at).getTime()) / 60000) : 0,
+              paper: true,
+            });
+          } catch (error) {
+            updatePaperPositionPnl(pp.position, { refresh_error: error.message, pnl_source: "stale_pnl" });
+            logPaperPnlWarning(
+              `poll:${pp.position}:${error.message}`,
+              `Stale paper PnL poll for ${pp.pool_name || pp.pool}: ${error.message}; skipping PnL exits`,
+            );
+          }
+        }
+      } else {
+        const result = await getMyPositions({ force: true, silent: true }).catch(() => null);
+        pollPositions = result?.positions || [];
+      }
+      if (!pollPositions.length) return;
+      for (const p of pollPositions) {
         if (
           !p.pnl_pct_suspicious &&
           queuePeakConfirmation(p.position, p.pnl_pct, { immediate: !shouldUsePnlRecheck() }) &&
