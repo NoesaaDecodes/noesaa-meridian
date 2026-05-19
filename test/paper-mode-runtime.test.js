@@ -72,7 +72,7 @@ test("api auth errors are classified as infrastructure, not candidate failure", 
   assert.match(classified.operatorMessage, /INFRA\/AUTH/);
 });
 
-test("paper deploy verification auth failure is blocked as infrastructure", () => {
+test("PAPER_ONLY deploy_position ignores endpoint failures and creates simulated position", () => {
   resetState();
   state.initPaperAccount({ startingBalanceSol: 0.5 });
   const code = `
@@ -82,6 +82,49 @@ test("paper deploy verification auth failure is blocked as infrastructure", () =
     process.env.PAPER_STARTING_BALANCE_SOL = "0.5";
     process.env.PAPER_MIN_DEPLOY_SOL = "0.05";
     process.env.PAPER_MAX_DEPLOY_SOL = "0.1";
+    globalThis.fetch = async () => { throw new Error("endpoint relay/live fetch should not be called"); };
+    const { executeTool } = await import(${JSON.stringify(pathToFileURL(path.resolve("tools/executor.js")).href)});
+    const result = await executeTool("deploy_position", {
+      pool_address: "Pool111111111111111111111111111111111111111",
+      amount_y: 0.05,
+      amount_x: 0,
+      bins_below: 35,
+      bins_above: 0,
+      volatility: 1,
+      fee_tvl_ratio: 0.05,
+      bin_step: 100,
+      pool_name: "SAFE-SOL",
+    });
+    console.log("RESULT:" + JSON.stringify(result));
+    process.exit(0);
+  `;
+  const child = spawnSync(process.execPath, ["--input-type=module", "-e", code], {
+    cwd: path.resolve("."),
+    encoding: "utf8",
+    env: { ...process.env },
+    timeout: 10_000,
+  });
+  assert.equal(child.status, 0, child.stderr || child.stdout);
+  const line = child.stdout.split(/\r?\n/).find((entry) => entry.startsWith("RESULT:"));
+  assert.ok(line, child.stdout);
+  const result = JSON.parse(line.slice("RESULT:".length));
+  assert.equal(result.success, true);
+  assert.equal(result.paper_only, true);
+  assert.equal(result.simulated, true);
+  assert.equal(result.message, "PAPER DEPLOY SIMULATED");
+  assert.ok(result.position);
+
+  const stored = JSON.parse(fs.readFileSync(stateFile, "utf8"));
+  assert.equal(Object.keys(stored.positions).length, 1);
+  assert.equal(stored.paperAccount.available_balance_sol, 0.45);
+});
+
+test("live deploy verification endpoint failures still block deploy", () => {
+  resetState();
+  const code = `
+    process.env.MERIDIAN_STATE_FILE = ${JSON.stringify(stateFile)};
+    process.env.PAPER_ONLY = "false";
+    process.env.DRY_RUN = "true";
     globalThis.fetch = async () => ({
       ok: false,
       status: 401,
@@ -104,7 +147,7 @@ test("paper deploy verification auth failure is blocked as infrastructure", () =
   const child = spawnSync(process.execPath, ["--input-type=module", "-e", code], {
     cwd: path.resolve("."),
     encoding: "utf8",
-    env: { ...process.env },
+    env: { ...process.env, PAPER_ONLY: "false", DRY_RUN: "true" },
     timeout: 10_000,
   });
   assert.equal(child.status, 0, child.stderr || child.stdout);
@@ -114,7 +157,23 @@ test("paper deploy verification auth failure is blocked as infrastructure", () =
   assert.equal(result.blocked, true);
   assert.equal(result.type, "infrastructure_auth");
   assert.equal(result.authFailure, true);
-  assert.match(result.reason, /not a candidate rejection/i);
+});
+
+test("toxic token symbols and names are rejected", async () => {
+  const { getToxicTokenRejectReason } = await import("../tools/screening.js");
+
+  assert.match(getToxicTokenRejectReason({
+    name: "SCAM-SOL",
+    base: { symbol: "SCAM" },
+  }), /SCAM/);
+  assert.match(getToxicTokenRejectReason({
+    name: "Friendly RUG Pool",
+    base: { symbol: "FRIEND" },
+  }), /RUG/);
+  assert.equal(getToxicTokenRejectReason({
+    name: "CLEAN-SOL",
+    base: { symbol: "CLEAN" },
+  }), null);
 });
 
 test("paper mode uses exploratory fee threshold without changing live default", () => {

@@ -32,6 +32,7 @@ function preDeployJitter() {
 import { log } from "../logger.js";
 import {
   trackPosition,
+  trackPaperPosition,
   markOutOfRange,
   markInRange,
   recordClaim,
@@ -483,6 +484,8 @@ export async function deployPosition({
   fee_tvl_ratio,
   organic_score,
   initial_value_usd,
+  active_bin,
+  entry_price_sol,
 }) {
   pool_address = normalizeMint(pool_address);
   const activeStrategy = strategy || config.strategy.strategy;
@@ -498,6 +501,105 @@ export async function deployPosition({
   if (isPoolOnCooldown(pool_address)) {
     log("deploy", `Pool ${pool_address.slice(0, 8)} is on cooldown — skipping`);
     return { success: false, error: "Pool on cooldown — was recently closed with a cooldown reason. Try a different pool." };
+  }
+
+  if (process.env.PAPER_ONLY === "true" || config.paper?.enabled === true) {
+    const finalAmountY = Number(amount_y ?? amount_sol ?? 0);
+    const finalAmountX = Number(amount_x ?? 0);
+    activeBinsBelow = Number(activeBinsBelow);
+    activeBinsAbove = Number(activeBinsAbove);
+
+    if (!Number.isFinite(finalAmountY) || finalAmountY <= 0) {
+      throw new Error("Invalid paper deploy amount: provide a positive amount_y/amount_sol.");
+    }
+    if (!Number.isFinite(finalAmountX) || finalAmountX < 0) {
+      throw new Error("Invalid paper deploy amount: amount_x must be a valid non-negative number.");
+    }
+    if (finalAmountX > 0) {
+      throw new Error("Unsupported paper deploy amount: this agent only supports single-side SOL deploys.");
+    }
+    if (!Number.isInteger(activeBinsBelow) || activeBinsBelow < 0 || !Number.isInteger(activeBinsAbove) || activeBinsAbove !== 0) {
+      throw new Error("Invalid paper deploy range: single-side SOL deploys require whole-number bins_below and bins_above=0.");
+    }
+
+    const minBinsBelow = Math.max(MIN_SAFE_BINS_BELOW, Number(config.strategy.minBinsBelow ?? MIN_SAFE_BINS_BELOW));
+    if (activeBinsBelow < minBinsBelow) {
+      throw new Error(`Invalid paper deploy range: bins_below ${activeBinsBelow} is below minimum ${minBinsBelow}.`);
+    }
+
+    const simulatedActiveBin = Number.isFinite(Number(active_bin)) ? Number(active_bin) : 0;
+    const minBinId = simulatedActiveBin - activeBinsBelow;
+    const maxBinId = simulatedActiveBin;
+    const position = `paper_${Date.now()}_${Math.random().toString(36).slice(2, 10)}`;
+    const paperOptions = {
+      startingBalanceSol: config.paper.startingBalanceSol,
+      maxOpenPositions: config.paper.maxOpenPositions,
+      positionSizePct: config.paper.positionSizePct,
+      minDeploySol: config.paper.minDeploySol,
+      maxDeploySol: config.paper.maxDeploySol,
+      gasReserveSol: config.paper.gasReserveSol,
+      cooldownMinutesAfterClose: config.paper.cooldownMinutesAfterClose,
+    };
+
+    const tracked = trackPaperPosition({
+      position,
+      pool: pool_address,
+      pool_name,
+      strategy: activeStrategy,
+      bin_range: { min: minBinId, max: maxBinId, bins_below: activeBinsBelow, bins_above: 0 },
+      amount_sol: finalAmountY,
+      active_bin: simulatedActiveBin,
+      bin_step,
+      volatility: normalizedVolatility,
+      fee_tvl_ratio,
+      organic_score,
+      entry_price_sol: entry_price_sol ?? null,
+      paper_options: paperOptions,
+    });
+    if (!tracked.ok) return { success: false, error: tracked.reason };
+
+    log("paper", `PAPER DEPLOY SIMULATED: ${pool_name || pool_address} | ${finalAmountY} SOL | bins ${minBinId}->${maxBinId}`);
+    appendDecision({
+      type: "deploy",
+      actor: "SCREENER",
+      pool: pool_address,
+      pool_name,
+      position,
+      summary: `PAPER DEPLOY SIMULATED ${finalAmountY} SOL with ${activeStrategy}`,
+      reason: `Simulated range ${minBinId}->${maxBinId} around active bin ${simulatedActiveBin}`,
+      risks: [
+        normalizedVolatility != null ? `volatility ${normalizedVolatility}` : null,
+        fee_tvl_ratio != null ? `fee/TVL ${fee_tvl_ratio}%` : null,
+      ].filter(Boolean),
+      metrics: {
+        paper_only: true,
+        amount_sol: finalAmountY,
+        strategy: activeStrategy,
+        active_bin: simulatedActiveBin,
+        min_bin: minBinId,
+        max_bin: maxBinId,
+      },
+    });
+
+    return {
+      success: true,
+      paper_only: true,
+      simulated: true,
+      message: "PAPER DEPLOY SIMULATED",
+      position,
+      pool: pool_address,
+      pool_name,
+      bin_range: { min: minBinId, max: maxBinId, active: simulatedActiveBin },
+      price_range: { min: null, max: null },
+      range_coverage: { downside_pct: null, upside_pct: 0, width_pct: null, active_price: entry_price_sol ?? null },
+      bin_step,
+      base_fee,
+      strategy: activeStrategy,
+      wide_range: activeBinsBelow > 69,
+      amount_x: finalAmountX,
+      amount_y: finalAmountY,
+      virtual_balance_sol: tracked.account?.available_balance_sol,
+    };
   }
 
   const { StrategyType, getBinIdFromPrice, getPriceOfBinByBinId } = await getDLMM();

@@ -20,7 +20,7 @@ import {
   setPositionInstruction,
 } from "../state.js";
 
-import { getPoolMemory, addPoolNote } from "../pool-memory.js";
+import { getPoolMemory, addPoolNote, isBaseMintOnCooldown } from "../pool-memory.js";
 import { addStrategy, listStrategies, getStrategy, setActiveStrategy, removeStrategy } from "../strategy-library.js";
 import { addToBlacklist, removeFromBlacklist, listBlacklist } from "../token-blacklist.js";
 import { blockDev, unblockDev, listBlockedDevs } from "../dev-blocklist.js";
@@ -143,6 +143,10 @@ async function validateDeployPoolThresholds(args) {
     if (!detail) throw new Error(`Pool ${args.pool_address} not found`);
   } catch (error) {
     const classified = classifyApiError(error, error.provider || "Meteora Pool Discovery");
+    if (isPaperOnlyMode()) {
+      log("paper", `${classified.operatorMessage} Paper deploy verification will continue with local guards; endpoint failure is not a simulated deploy blocker.`);
+      return { pass: true, paperVerificationWarning: classified.operatorMessage };
+    }
     return {
       pass: false,
       type: classified.infrastructureFailure ? "infrastructure_auth" : "infrastructure",
@@ -837,6 +841,12 @@ async function runSafetyChecks(name, args) {
 
       // Block same base token across different pools
       if (args.base_mint) {
+        if (isBaseMintOnCooldown(args.base_mint)) {
+          return {
+            pass: false,
+            reason: `Token on cooldown: ${args.base_mint}. Try a different token.`,
+          };
+        }
         const alreadyHasMint = positions.positions.some(
           (p) => p.base_mint === args.base_mint
         );

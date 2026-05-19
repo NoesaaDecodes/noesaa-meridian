@@ -25,9 +25,42 @@ const PVP_RIVAL_LIMIT = 2;
 const PVP_MIN_ACTIVE_TVL = 5_000;
 const PVP_MIN_HOLDERS = 500;
 const PVP_MIN_GLOBAL_FEES_SOL = 30;
+const TOXIC_TOKEN_TERMS = new Set([
+  "SCAM",
+  "RUG",
+  "HONEYPOT",
+  "DRAIN",
+  "EXPLOIT",
+  "PHISH",
+  "FAKE",
+  "PONZI",
+]);
 
 function normalizeSymbol(symbol) {
   return String(symbol || "").trim().toUpperCase();
+}
+
+function toxicTokenTerm(value) {
+  const normalized = normalizeSymbol(value);
+  if (!normalized) return null;
+  const parts = normalized.split(/[^A-Z0-9]+/).filter(Boolean);
+  for (const part of parts) {
+    if (TOXIC_TOKEN_TERMS.has(part)) return part;
+  }
+  return TOXIC_TOKEN_TERMS.has(normalized) ? normalized : null;
+}
+
+export function getToxicTokenRejectReason(pool) {
+  const checks = [
+    ["symbol", pool?.base?.symbol ?? pool?.token_x?.symbol],
+    ["name", pool?.name],
+    ["base name", pool?.base?.name ?? pool?.token_x?.name],
+  ];
+  for (const [field, value] of checks) {
+    const term = toxicTokenTerm(value);
+    if (term) return `toxic token ${field} contains ${term}`;
+  }
+  return null;
 }
 
 function scoreCandidate(pool) {
@@ -93,7 +126,9 @@ function getRawPoolScreeningRejectReason(pool, s) {
   const quoteOrganic = numeric(quote?.organic_score);
   const launchpad = getPoolLaunchpad(pool);
   const createdAt = numeric(base?.created_at);
+  const toxicReason = getToxicTokenRejectReason(pool);
 
+  if (toxicReason) return toxicReason;
   if (s.excludeHighSupplyConcentration && pool?.base_token_has_high_supply_concentration === true) {
     return "base token has high supply concentration";
   }
@@ -445,6 +480,12 @@ export async function discoverPools({
 
   // Hard-filter blacklisted tokens and blocked deployers (what pool discovery already gave us)
   let pools = condensed.filter((p) => {
+    const toxicReason = getToxicTokenRejectReason(p);
+    if (toxicReason) {
+      log("screening", `Toxic token filter: dropped ${p.name} - ${toxicReason}`);
+      filteredExamples.push({ name: p.name || p.pool || "unknown pool", reason: toxicReason });
+      return false;
+    }
     if (isBlacklisted(p.base?.mint)) {
       log("blacklist", `Filtered blacklisted token ${p.base?.symbol} (${p.base?.mint?.slice(0, 8)}) in pool ${p.name}`);
       return false;
@@ -536,6 +577,12 @@ export async function getTopCandidates({ limit = 10 } = {}) {
       }
       if (!isUsableVolatility(p.volatility)) {
         pushFilteredReason(filteredOut, p, `volatility ${p.volatility ?? "unknown"} is unusable`);
+        return false;
+      }
+      const toxicReason = getToxicTokenRejectReason(p);
+      if (toxicReason) {
+        log("screening", `Toxic token filter: dropped ${p.name} - ${toxicReason}`);
+        pushFilteredReason(filteredOut, p, toxicReason);
         return false;
       }
       if (occupiedPools.has(p.pool)) {
